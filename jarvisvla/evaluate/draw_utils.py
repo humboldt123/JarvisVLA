@@ -163,7 +163,8 @@ def producing_loss(model_name):
     import json
     import ast
     """
-    由于离线的wandb存在问题，所以单独处理training loss数据和eval loss，把它们存储成一个List[Dict]格式 
+    Separately process training loss and eval loss data (due to offline wandb issues)
+    and store them in List[Dict] format.
     """
     notes = []
     raw_data_path = Path("ultron/benchmark/mc_gui/record/loss_raw")/f"{model_name}.log"
@@ -205,7 +206,7 @@ def get_losses(model_name:str,eval_step:int=100,normal_step_rate:float=1):
     train_losses = loss_record["train"]
     train_losses_keys = list(train_losses.keys())
     polished_training_loss = {}
-    # 在一般训练场景下需要几步
+    # How many steps needed in a normal training scenario
     aligned_steps = len(train_losses)*normal_step_rate
     jdx = float(0)
     for step in range(aligned_steps):
@@ -235,7 +236,7 @@ def get_success_record(model_name:str,task_name:str,normal_step_rate:float,data_
         if path.is_dir():
             match = pattern.match(path.name)
             if match:
-                label = match.group(1)  # 抽取中间部分作为 label
+                label = match.group(1)  # Extract the middle part as label
                 if label[0]=='-':
                     label = label[1:]
                 if label[-1]=='-':
@@ -263,7 +264,7 @@ def count_success_rate(success_records:List[tuple]):
     return success_rates
 
 def uploading_wandb(model:str,task:str,loss_record:dict,success_rates):
-    """上传step-train_loss-eval_loss-success_rate"""
+    """Upload step-train_loss-eval_loss-success_rate to wandb"""
     import wandb
     from tqdm import tqdm
     import os
@@ -309,15 +310,15 @@ def draw_whole_pictures(max_step:int):
     parser.add_argument('--normal_step_rate',"-n", type=int, default=1,help="the training step represent how many steps when you set batchsize=16,a=4,card_num=4？") 
     args = parser.parse_args()
     task_name= args.task_name.split("/")[-1]
-    # 获取原始的训练数据
+    # Get raw training data
     #producing_loss(args.model_name)
-    
-    # 处理loss数据
+
+    # Process loss data
     eval_loss_record,train_loss_record = get_losses(args.model_name,args.eval_step,args.normal_step_rate)
     print(eval_loss_record)
-    # 获取原始成功率数据
+    # Get raw success rate data
     success_records = get_success_record(args.model_name,task_name,args.normal_step_rate)
-    # 处理成功率数据
+    # Process success rate data
     success_rates = count_success_rate(success_records)
     print(success_rates)
 
@@ -341,9 +342,9 @@ def draw_1model1task():
     
     task_name= args.task_name.split("/")[-1]
     
-    # 获取原始成功率数据
+    # Get raw success rate data
     success_records = get_success_record(args.model_name,task_name,args.normal_step_rate,data_fold=Path("/public/lmy/evaluate"))
-    # 处理成功率数据
+    # Process success rate data
     success_rates = count_success_rate(success_records)
     print(success_rates)
     

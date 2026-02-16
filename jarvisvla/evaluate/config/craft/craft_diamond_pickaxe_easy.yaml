@@ -1,0 +1,35 @@
+defaults:
+  - base
+  - _self_
+
+# Override: no worker, no GUI automation — let the model figure it out
+worker: null
+need_gui: False
+need_crafting_table: False
+
+command:
+  - "/effect give @a minecraft:resistance 5 200 true"
+  - "/tp @a ~ 11 ~"
+  - "/fill ~-3 ~-1 ~-3 ~3 ~-1 ~3 minecraft:stone"
+  - "/fill ~-2 ~ ~-2 ~2 ~3 ~2 minecraft:air"
+  - "/setblock ~2 ~ ~2 minecraft:diamond_ore"
+  - "/setblock ~2 ~ ~1 minecraft:diamond_ore"
+  - "/setblock ~2 ~ ~0 minecraft:diamond_ore"
+  - "/setblock ~-1 ~ ~-1 minecraft:crafting_table"
+
+task_conf:
+  - name: "craft"
+    text: "craft a diamond pickaxe"
+
+reward_conf:
+  - event: "craft_item"
+    max_reward_times: 1
+    reward: 1.0
+    objects:
+      - "diamond_pickaxe"
+    identity: "craft diamond_pickaxe"
+
+init_inventory:
+  - slot: 0
+    type: "iron_pickaxe"
+    quantity: 1

@@ -39,9 +39,9 @@ class VLLM_AGENT:
         self.LLM_backbone,self.VLM_backbone = load_model.load_visual_model(checkpoint_path=checkpoint_path)
         self.action_tokenizer = action_mapping.OneActionTokenizer(tokenizer_type=self.LLM_backbone)
         
-        self.prompt_library = load_json_file(Path(__file__).parent/"assets"/"instructions.json") #存储我写好的instructions
-        self.recipe_fold=Path(__file__).parent/"assets"/"recipes" # 存储所有recipes的文件夹
-        self.recipes = dict()  #制作方案集合
+        self.prompt_library = load_json_file(Path(__file__).parent/"assets"/"instructions.json") # Pre-written instructions
+        self.recipe_fold=Path(__file__).parent/"assets"/"recipes" # Folder storing all recipes
+        self.recipes = dict()  # Collection of crafting recipes
         self.method_map = {
             True: "crafting table",
             False: "inventory",
@@ -50,8 +50,8 @@ class VLLM_AGENT:
         self.processor_wrapper = processor_wrapper.ProcessorWrapper(None,model_name=self.VLM_backbone)
        
         self.actions = []
-        self.action_chunk_len=action_chunk_len  # 一次返回一个action chunk
-        # 用于带有记忆的agent
+        self.action_chunk_len=action_chunk_len  # Return one action chunk at a time
+        # For agent with memory
         self.history_num = history_num
         self.history = []
         self.api_key = api_key
@@ -166,9 +166,9 @@ class VLLM_AGENT:
         return prompt
         
     def create_recipe_prompt(self,env_prompt:str,method:str="crafting_table"):
-        """从原始的一句话转换成prompt """
+        """Convert raw instruction text into a prompt"""
         prompt = ""
-        # 如果使用recipe book to craft
+        # If using recipe book to craft
         if "recipe_book" in method:
             prompt += "\nUse the recipe book to craft. \n"
             return prompt
@@ -209,6 +209,7 @@ class VLLM_AGENT:
         if self.actions:
             if verbos:
                 print(self.actions)
+            # Use cached LLM output if we're returning cached actions
             if len(self.actions)>1:
                 return self.actions.pop(0)
             else:
@@ -220,18 +221,22 @@ class VLLM_AGENT:
         method = self.method_map[need_crafting_table]
         prompts = []
         private_instruction = self.create_instruction(instructions[0],method=method)
-        #print(private_instruction)
+        self.last_instruction = private_instruction
+        if verbos:
+            print(f"\n=== INSTRUCTION ===\n{private_instruction}\n===================")
         thought= self.create_thought(instructions[0]) if self.instruction_type =="recipe" else ""
+        if verbos and thought:
+            print(f"=== THOUGHT/RECIPE ===\n{thought}\n======================")
 
         if self.history_num:
-            if not self.history: #如果历史为空
+            if not self.history: # If history is empty
                 self.history = [(image,self.action_tokenizer.null_token(),copy.copy(thought),0)]*self.history_num
             new_history = [None]*self.history_num
             new_history[:-1] = self.history[1:]
             for hdx,(im, ac, past_thought,_) in enumerate(self.history):
                 prompt_input = ""
                 if self.instruction_type == 'recipe':
-                    prompt_input = "\nthought: " + past_thought + "\nobservation: "  #往上一个prompt上加上这一步的thought
+                    prompt_input = "\nthought: " + past_thought + "\nobservation: "  # Append this step's thought to the previous prompt
                 else:
                     prompt_input = "\nobservation: "
                 if not hdx: #hdx==0
@@ -247,7 +252,8 @@ class VLLM_AGENT:
             prompt_input = "\nobservation: "
         if not self.history_num:
             prompt_input = private_instruction + prompt_input
-        #print(prompt_input)
+        if verbos:
+            print(f"=== PROMPT INPUT ===\n{prompt_input}\n====================")
 
         messages.append(self.processor_wrapper.create_message_vllm(role="user",input_type="image",prompt=[prompt_input],image=[image]))
         
@@ -267,6 +273,11 @@ class VLLM_AGENT:
         )
 
         outputs = chat_completion.choices[0].message.content
+
+        # Store the raw LLM output for display purposes
+        self.last_llm_output = outputs
+        self.last_thought = thought
+
         if self.history_num:
             new_history[-1] = (image,outputs,thought,self.history[-1][-1]+1)
             self.history = new_history
@@ -277,5 +288,72 @@ class VLLM_AGENT:
 
         len_action = min(self.action_chunk_len,len(actions))
         self.actions = actions[:len_action]
-        
+
         return self.actions.pop(0)
+
+    # Logit bias dict to suppress action tokens (built once, reused)
+    _vlm_suppress = None
+
+    @classmethod
+    def _get_vlm_suppress(cls):
+        if cls._vlm_suppress is None:
+            s = {str(tid): -100 for tid in range(151675, 151908)}
+            s["677"] = -100    # [' wrapper
+            s["151644"] = -100 # <|im_start|>
+            cls._vlm_suppress = s
+        return cls._vlm_suppress
+
+    def query_vlm(self, observation, question, max_tokens=256, include_image=None):
+        """Query the model in standard VLM mode (not trajectory mode).
+
+        Stage III fine-tuning made the model output action tokens whenever it
+        sees a Minecraft image. Text-only queries work much better for
+        knowledge questions. By default, we auto-detect: if the question asks
+        about the visual scene we include the image, otherwise text-only.
+
+        Args:
+            observation: numpy array of current game frame (may be ignored)
+            question: natural language question
+            max_tokens: max response length
+            include_image: True/False to force, None to auto-detect
+        """
+        # Auto-detect whether the question needs visual context
+        if include_image is None:
+            visual_keywords = ['see', 'look', 'scene', 'describe', 'around',
+                               'front', 'screen', 'image', 'frame', 'block',
+                               'nearby', 'biome', 'mob', 'entity', 'wearing',
+                               'holding', 'inventory']
+            include_image = any(kw in question.lower() for kw in visual_keywords)
+
+        if include_image:
+            image = self.processor_wrapper.create_image_input(observation)
+            messages = [
+                self.processor_wrapper.create_message_vllm(
+                    role="user", input_type="image",
+                    prompt=[question], image=[image],
+                )
+            ]
+        else:
+            messages = [
+                self.processor_wrapper.create_message_vllm(
+                    role="user", input_type="text",
+                    prompt=[question],
+                )
+            ]
+
+        chat_completion = self.client.chat.completions.create(
+            messages=messages,
+            model=self.model,
+            temperature=0.7,
+            max_tokens=max_tokens,
+            top_p=0.99,
+            logit_bias=self._get_vlm_suppress(),
+            frequency_penalty=0.5,
+            extra_body={
+                "skip_special_tokens": True,
+                "top_k": -1,
+                "repetition_penalty": 1.3,
+            },
+        )
+
+        return chat_completion.choices[0].message.content

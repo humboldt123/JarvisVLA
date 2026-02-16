@@ -134,7 +134,7 @@ if __name__ == "__main__":
     # DataCollator
     ##################
 
-    # 找到image_fold
+    # Find image folder
     image_fold = pathlib.Path(sft_script_args.dataset_name).parent
     image_fold = image_fold.parent if image_fold.name=="output" else image_fold
     data_collator = make_collator(more_cfg.collator_type, 

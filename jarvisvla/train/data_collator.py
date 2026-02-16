@@ -296,7 +296,7 @@ class VLAMultimodalChatDataCollatorforVLM(MultimodalChatDataCollatorforVLM):
 
 def apply_private_conversations(conversations:list, tokenizer=None):
     """Prepare the text from a sample of the dataset."""
-    # LLAVA_next: batches处理的时候，输入的是所有images，然后根据<image>来分配
+    # LLAVA_next: when processing batches, all images are input and assigned based on <image> tags
     conversations = []
     for conv in conversations:
         content = ""
@@ -380,7 +380,7 @@ def get_image_center(image_size: Tuple[float, float]):
     return (image_size[0] / 2, image_size[1] / 2)
 
 def get_image_center(image_size: Tuple[float, float]) -> Tuple[float, float]:
-    """示例中心点获取函数：返回图像中心 (cx, cy)。"""
+    """Get image center point: returns (cx, cy)."""
     w, h = image_size
     return (w / 2.0, h / 2.0)
 
@@ -396,10 +396,10 @@ def point_rotate_augmentation(
     w, h = image_size
     center = get_image_center(image_size)
 
-    # 注意：rotate_degree > 0 时，这里的角度是顺时针旋转
+    # Note: when rotate_degree > 0, the angle is clockwise rotation
     angle = math.radians(rotate_degree)
     
-    # 构建基础仿射矩阵：先只考虑在原点旋转
+    # Build base affine matrix: rotation around origin only
     matrix = [
         round(math.cos(angle), 15),
         round(math.sin(angle), 15),
@@ -409,19 +409,19 @@ def point_rotate_augmentation(
         0.0,
     ]
     
-    # transform 函数，用于将 (x, y) 应用矩阵变换
+    # Transform function to apply matrix transformation to (x, y)
     def transform(x, y, matrix):
         (a, b, c, d, e, f) = matrix
         return a * x + b * y + c, d * x + e * y + f
     
-    # 第一步：将图像从 (cx, cy) 平移到原点，再做旋转
-    # 也就是先对 -(center_x), -(center_y) 做 transform，然后再回移回来
+    # Step 1: Translate image from (cx, cy) to origin, then rotate
+    # i.e., transform -(center_x), -(center_y) then translate back
     matrix[2], matrix[5] = transform(-center[0], -center[1], matrix)
     matrix[2] += center[0]
     matrix[5] += center[1]
     
-    # 如果需要 expand，重新计算旋转后包裹图像的新的 w, h，并对 matrix 进行平移修正
-    # TODO 有bug 暂时无法启用
+    # If expand is needed, recalculate new w, h to wrap the rotated image and adjust matrix translation
+    # TODO has a bug, cannot be enabled yet
     if expand:
         # calculate output size
         xx = []
@@ -439,7 +439,7 @@ def point_rotate_augmentation(
         matrix[2], matrix[5] = transform(-(nw - w) / 2.0, -(nh - h) / 2.0, matrix)
         w, h = nw, nh
     
-    # 最后一步：对目标点进行矩阵变换，得到旋转后的 new_x, new_y
+    # Final step: apply matrix transformation to the target point to get rotated new_x, new_y
     new_x, new_y = transform(point_x, point_y, matrix)
     return (new_x, new_y), (w, h)
 
@@ -544,7 +544,7 @@ def fetch_image(image: Image.Image,  factor: int, min_pixels: int, max_pixels: i
 #############################
 
 class DataAugment(object):
-    # 定义可能使用到的增强方法名称
+    # Define available augmentation method names
     HUE = "hue"
     SATURATION = "saturation"
     BRIGHTNESS = "brightness"
@@ -561,7 +561,7 @@ class DataAugment(object):
                  random_image_size: Tuple[int, int]=(224,224), default_image_size: Tuple[int, int]=None,
                  image_factor:int=None, min_pixels:int=None,  max_pixels:int=None, max_ratio:int=None):
         """
-        methods: 传入想要应用的增强类型列表, 比如 [DataAugment.ROTATE, DataAugment.TRANSLATE, ...]
+        methods: List of augmentation types to apply, e.g. [DataAugment.ROTATE, DataAugment.TRANSLATE, ...]
         """
         
         self.model_type = model_type
@@ -569,7 +569,7 @@ class DataAugment(object):
         self.methods = methods  
         for method in methods:
             assert method in DataAugment.LEGAL_METHODS, f"illegal method: {method}"
-        self.params = {} # 用于存储当次刷新得到的随机参数
+        self.params = {} # Stores randomly generated params for current refresh
         
         self.image_folder = image_folder
         self.random_image_size = random_image_size
@@ -595,14 +595,14 @@ class DataAugment(object):
         translate_max: int = 10
         ):
         """
-        refresh() 用来刷新一次「本批次」的增强参数，比如随机多少度旋转、平移多少像素等等。
-        每次调用 refresh()，都会覆盖以前的参数。
+        Refresh augmentation params for the current batch (e.g. random rotation degrees, translation pixels, etc.).
+        Each call to refresh() overwrites previous params.
         """
-        self.params = {}  # 每次重新生成
+        self.params = {}  # Regenerate each time
 
-        # 颜色类增强
+        # Color augmentations
         if self.HUE in self.methods:
-            # hue_factor 在 -hue_range ~ +hue_range 之间
+            # hue_factor in range [-hue_range, +hue_range]
             hue_factor = random.uniform(-hue_range, hue_range)
             self.params[self.HUE] = hue_factor
 
@@ -618,7 +618,7 @@ class DataAugment(object):
             contrast_factor = random.uniform(*contrast_range)
             self.params[self.CONTRAST] = contrast_factor
 
-        # 几何类增强
+        # Geometric augmentations
         if self.ROTATE in self.methods:
             rotate_degree = random.uniform(*rotate_range)
             self.params[self.ROTATE] = rotate_degree
@@ -633,7 +633,7 @@ class DataAugment(object):
             self.params[self.SHEAR] = shear_degree
         
         if self.FLIP in self.methods:
-            # 随机决定是否水平翻转、是否垂直翻转
+            # Randomly decide whether to flip horizontally/vertically
             x_flip = random.choices([False, True], [1 - flip_p, flip_p])[0]
             y_flip = random.choices([False, True], [1 - flip_p, flip_p])[0]
             self.params[self.FLIP] = (x_flip, y_flip)
@@ -669,7 +669,7 @@ class DataAugment(object):
         return image
             
     def image_augment(self, image: Image.Image) -> Image.Image:
-        """ 根据 flesh() 刷新的参数，对图像进行增强。 """
+        """Apply augmentations to the image based on params from refresh()."""
         for method in self.methods:
             if method == self.HUE:
                 image = image_hue_augmentation(image,hue_factor=self.params[self.HUE])
@@ -711,21 +711,21 @@ class DataAugment(object):
     def image_process(self, image_path:Union[str,Path]) -> Tensor:
         
         try:  
-            # 打开并统一转换到RGB
+            # Open and convert to RGB
             image = self.image_open(image_path)
             self.raw_image_size = image.size
             
-            # image数据增强
+            # Image data augmentation
             image = self.image_augment(image)
             self.augment_image_size = image.size
             
-            # 缩放到VLM适合的大小
+            # Resize to VLM-compatible dimensions
             image = self.image_resize(image)
             self.resize_image_size = image.size
             
-            #1. 从整数（通常范围是 0-255）转换为浮点数。
-            #2. 将像素值缩放到 [0, 1] 的范围。
-            #3. 维度重排序
+            #1. Convert from integers (typically 0-255) to float.
+            #2. Scale pixel values to [0, 1] range.
+            #3. Reorder dimensions
             transform = transforms.ToTensor() 
             image = transform(image)
             
@@ -738,9 +738,9 @@ class DataAugment(object):
     def point_adapt(self, point: Tuple[float, float]):
         """
         point: (x1, y1), (x2, y2)
-        适应图像经过变换后的新点坐标列表。
+        Adapt point coordinates to the transformed image.
         """
-        # 特对于 rotate / scale / shear / flip / translate，要与图像同一中心或同一个坐标变换基准。
+        # For rotate / scale / shear / flip / translate, use the same center/coordinate transform basis as the image.
         image_size = deepcopy(self.raw_image_size)
         width, height = image_size
         

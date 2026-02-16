@@ -52,7 +52,7 @@ class CraftWorker(GUIWorker):
             with open(tag_json_path) as file:
                 tag_info = json.load(file)
             for key in tag_info:
-                if key[10:] == target:  #minecraft:crafting_table 去掉前面10个词
+                if key[10:] == target:  # Strip "minecraft:" prefix (first 10 chars)
                     is_tag = True
 
             # open recipe one by one: only shapeless crafting like oak_planks        
@@ -254,7 +254,7 @@ class CraftWorker(GUIWorker):
                 self.pull_item_all(self.crafting_slotpos, 'inventory_0', inventory_id_none)
             self.pull_item(self.crafting_slotpos, inventory_id, 'inventory_0','crafting_table', 1)
         
-        # 关闭仓库
+        # Close inventory
         self._press_inventory_button()
         self.current_gui_type = None
         self.crafting_slotpos = 'none'
@@ -263,10 +263,10 @@ class CraftWorker(GUIWorker):
             if not self.info['isGuiOpen']:
                 break
         self._call_func('hotbar.1') 
-        # 把crafting table放在地上
+        # Place crafting table on the ground
         self._place_down()
         for i in range(11):
-            self._call_func('use') # 打开crafting table
+            self._call_func('use') # Open crafting table
             if i>0 and i%10==0:
                 time.sleep(0.5)
             if self.info['isGuiOpen']:
@@ -275,7 +275,7 @@ class CraftWorker(GUIWorker):
         self._null_action(2)
 
         forget_frames,forget_infos,forget_actions = self.forget(num=0)
-        self._reset_cursor() #鼠标位置
+        self._reset_cursor() # Reset cursor position
         self.current_gui_type = 'crating_table_wo_recipe'
         self.crafting_slotpos = self.slot_pos_table_wo_recipe
         return forget_frames,forget_infos,forget_actions        
@@ -540,7 +540,7 @@ class CraftWorker(GUIWorker):
         for i in range(9):
             del labels["resource_"+str(i)]
         
-        # 看看目标在仓库中有没有
+        # Check if the target item already exists in inventory
         result_inventory_id_1 = self.find_in_inventory(labels, target)
         
         if result_inventory_id_1:
@@ -561,7 +561,7 @@ class CraftWorker(GUIWorker):
                 self.pull_item_result(self.crafting_slotpos, 'result_0', result_inventory_id_2, iter_num, target)
                 self._assert(self.get_labels().get(result_inventory_id_2).get('type') == target, f"fail for unkown reason 22222")
         else:
-            # 查找有没有空位
+            # Find an empty slot
             result_inventory_id_2 = self.find_in_inventory(labels, 'none')
             
             self._assert(result_inventory_id_2, f"no space to place result")
@@ -574,15 +574,15 @@ class CraftWorker(GUIWorker):
         self.resource_record =  {f'resource_{x}': {'type': 'none', 'quantity': 0} for x in range(9)}
         
     # shaped crafting
-    def crafting_shaped(self, target:str, iter_num:int, recipe_info: Dict,shuffle_p=0): # 1 - shuffle_p:多少概率洗牌
+    def crafting_shaped(self, target:str, iter_num:int, recipe_info: Dict,shuffle_p=0): # 1 - shuffle_p: probability of shuffling
         slot_pos = self.crafting_slotpos
         labels = self.get_labels()
         pattern = recipe_info.get('pattern')
         items = recipe_info.get('key')
-        items = random_dic(items) #加上随机化
+        items = random_dic(items) # Randomize order
         
         # place each item in order
-        if self.current_gui_type == 'crating_table_wo_recipe':#本来应该在打开的时候，但是显然现在不行了
+        if self.current_gui_type == 'crating_table_wo_recipe': # Should be done on open, but doesn't work there
             self._null_action()
             self.roam_camera()
             self.forget(num=0)

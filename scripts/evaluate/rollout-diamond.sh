@@ -1,22 +1,19 @@
 #!/bin/bash
 
-base_url=http://localhost:9012/v1
+base_url=http://localhost:8000/v1
 workers=5
 max_frames=500
 temperature=0.6
 history_num=2
 action_chunk_len=1
 instruction_type="normal"
-model_local_path="mc-vla-qwen2-vl-7b-250315-A800-c32-e1-b4-a1"
+model_local_path="CraftJarvis/JarvisVLA-Qwen2-VL-7B"
 
 tasks=(
-    "mine/mine_stone"
+    "mine/mine_diamond"
 )
 
-
-echo "Running for checkpoint $checkpoint..."
-
-log_path_name="$model_local_path-$checkpoint-$env_file"
+echo "Running for checkpoint $model_local_path..."
 
 for task in "${tasks[@]}"; do
     env_config="$task"
@@ -46,4 +43,4 @@ for task in "${tasks[@]}"; do
             sleep 10
         fi
     done
-done 
+done

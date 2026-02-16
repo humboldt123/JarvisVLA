@@ -64,7 +64,7 @@ def fetch_image(image: Image.Image,  factor: int, min_pixels: int, max_pixels: i
     return image
 
 def pil2base64(image):
-    """强制中间结果为jpeg""" 
+    """Force intermediate result to JPEG format"""
     buffered = BytesIO()
     image.save(buffered, format="JPEG")
     img_str = base64.b64encode(buffered.getvalue()).decode('utf-8')

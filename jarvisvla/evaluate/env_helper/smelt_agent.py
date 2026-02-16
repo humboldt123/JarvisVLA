@@ -40,7 +40,7 @@ class SmeltWorker(CraftWorker):
 
         self._place_down()
         for i in range(11):
-            self._call_func('use') # 打开crafting table
+            self._call_func('use') # Open crafting table
             if i>0 and i%10==0:
                 time.sleep(0.5)
             if self.info['isGuiOpen']:
@@ -49,7 +49,7 @@ class SmeltWorker(CraftWorker):
         self._null_action(2)
         
         forget_frames,forget_infos,forget_actions = self.forget(num=0)
-        self._reset_cursor() #鼠标位置
+        self._reset_cursor() # Reset cursor position
         self.current_gui_type = 'furnace_wo_recipe'
         self.crafting_slotpos = self.slot_furnace_wo_recipe
         return forget_frames,forget_infos,forget_actions   

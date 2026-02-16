@@ -4,6 +4,7 @@ from pathlib import Path
 import os
 import hydra
 import ray
+import cv2
 
 from minestudio.simulator import MinecraftSim
 from minestudio.simulator.entry import CameraConfig
@@ -18,8 +19,14 @@ from minestudio.simulator.callbacks import (
     CommandsCallback,
 )
 
-from jarvisvla.evaluate.env_helper.craft_agent import CraftWorker
-from jarvisvla.evaluate.env_helper.smelt_agent import SmeltWorker
+# Conditional imports for craft/smelt workers (only needed for specific tasks)
+try:
+    from jarvisvla.evaluate.env_helper.craft_agent import CraftWorker
+    from jarvisvla.evaluate.env_helper.smelt_agent import SmeltWorker
+except ImportError as e:
+    print(f"Warning: Could not import craft/smelt workers: {e}")
+    CraftWorker = None
+    SmeltWorker = None
 from jarvisvla.evaluate import draw_utils
 from jarvisvla.utils import file_utils
 from jarvisvla.evaluate import agent_wrapper
@@ -27,7 +34,7 @@ from jarvisvla.evaluate import agent_wrapper
 
 def evaluate(video_path,checkpoints,environment_config:dict,model_config:dict,device="cuda:0",base_url=None):
 
-    hydra.core.global_hydra.GlobalHydra.instance().clear() # 清理 Hydra 的全局实例
+    hydra.core.global_hydra.GlobalHydra.instance().clear() # Clear Hydra's global instance
     config_path = Path(f"{environment_config['env_config']}.yaml")
     config_name = config_path.stem
     config_path = os.path.join("./config",config_path.parent)
@@ -45,10 +52,10 @@ def evaluate(video_path,checkpoints,environment_config:dict,model_config:dict,de
         SpeedTestCallback(50), 
         TaskCallback(getattr(cfg,"task_conf",None)),
         RewardsCallback(getattr(cfg,"reward_conf",None)),
-        InitInventoryCallback(cfg.init_inventory,
-                                inventory_distraction_level=cfg.inventory_distraction_level,
-                                equip_distraction_level="normal"
-                                ),
+        InitInventoryCallback(
+            init_inventory=getattr(cfg, "init_inventory", []),
+            distraction_level=getattr(cfg, "inventory_distraction_level", [0])
+        ),
         CommandsCallback(getattr(cfg,"command",[]),),
         record_callback,
     ]
@@ -74,11 +81,17 @@ def evaluate(video_path,checkpoints,environment_config:dict,model_config:dict,de
     pre_agent = None
     worker_type =  getattr(cfg,"worker", None)
     if worker_type == "craft":
-        pre_agent = CraftWorker(env,if_discrete=True)
+        if CraftWorker is None:
+            console.Console().log("[yellow]Warning: CraftWorker not available, skipping craft worker initialization[/yellow]")
+        else:
+            pre_agent = CraftWorker(env,if_discrete=True)
     elif worker_type == "smelt":
-        pre_agent = SmeltWorker(env,if_discrete=True)
+        if SmeltWorker is None:
+            console.Console().log("[yellow]Warning: SmeltWorker not available, skipping smelt worker initialization[/yellow]")
+        else:
+            pre_agent = SmeltWorker(env,if_discrete=True)
     
-    # 把环境准备好
+    # Prepare the environment
     need_crafting_table = False
     if getattr(cfg, "need_gui", False):
         need_crafting_table= getattr(cfg,"need_crafting_table", False)
@@ -114,6 +127,34 @@ def evaluate(video_path,checkpoints,environment_config:dict,model_config:dict,de
     # get instruction
     instructions = [item["text"] for item in cfg.task_conf]
 
+    def _draw_instruction_on_frame(frame, text, step):
+        """Draw the current instruction as text overlay on the video frame."""
+        overlay = frame.copy()
+        h, w = frame.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        thickness = 1
+        margin = 8
+
+        # Wrap long text to multiple lines
+        max_chars = w // 7  # rough chars per line at this font scale
+        lines = []
+        for start in range(0, len(text), max_chars):
+            lines.append(text[start:start + max_chars])
+        lines.append(f"step: {step}")
+
+        # Draw semi-transparent black background
+        line_h = 18
+        box_h = len(lines) * line_h + margin * 2
+        cv2.rectangle(overlay, (0, 0), (w, box_h), (0, 0, 0), -1)
+        blended = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+        frame[:] = blended
+
+        # Draw text lines
+        for idx, line in enumerate(lines):
+            y = margin + (idx + 1) * line_h
+            cv2.putText(frame, line, (margin, y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
     success = (False,environment_config["max_frames"])
     for i in range(environment_config["max_frames"]):
         action = agent.forward([info["pov"]],instructions,verbos=environment_config["verbos"],need_crafting_table = need_crafting_table)
@@ -121,15 +162,31 @@ def evaluate(video_path,checkpoints,environment_config:dict,model_config:dict,de
             console.Console().log(action)
         obs, reward, terminated, truncated, info = env.step(action)
 
+        # Draw instruction text on the recorded frame
+        if record_callback.recording and record_callback.frames:
+            instruction_text = getattr(agent, 'last_instruction', '')
+            if instruction_text:
+                import numpy as np
+                frame = np.ascontiguousarray(record_callback.frames[-1]).copy()
+                _draw_instruction_on_frame(frame, instruction_text, i)
+                record_callback.frames[-1] = frame
+
         if reward > 0:
             success = (True,i)
-            break   
-        
+            break
+
     # sample another 30 steps if success
     if success[0]:
         for i in range(20):
             action = agent.forward([info["pov"]],instructions,verbos=environment_config["verbos"],need_crafting_table = need_crafting_table)
             obs, reward, terminated, truncated, info = env.step(action)
+            if record_callback.recording and record_callback.frames:
+                instruction_text = getattr(agent, 'last_instruction', '')
+                if instruction_text:
+                    import numpy as np
+                    frame = np.ascontiguousarray(record_callback.frames[-1]).copy()
+                    _draw_instruction_on_frame(frame, instruction_text, environment_config["max_frames"] + i)
+                    record_callback.frames[-1] = frame
          
     env.close()
     return success
@@ -193,7 +250,7 @@ def multi_evaluate(args):
         
         ray.shutdown()
         
-        # 写入日志文件
+        # Write to log file
         file_utils.dump_json_file(resultss,video_log_path)
     draw_utils.show_success_rate(resultss,os.path.join(video_fold,"image.png") )
 

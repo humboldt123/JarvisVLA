@@ -262,14 +262,14 @@ class GUIWorker(object):
                 d2 = (camera_y / num_steps) 
                 self.move_once(d1, d2)
             return
-        #如果需要离散化的话
-        for _ in range(100): #如果超过20次则不再调整
+        # If discretization is needed
+        for _ in range(100): # Stop adjusting after max iterations
             
             camera_x = x - self.cursor[0]
             camera_y = y - self.cursor[1]
             distance =max(abs(camera_x), abs(camera_y))
             #print(distance)
-            if distance <3: #当已经非常接近，就散了
+            if distance <3: # Close enough, stop
                 break
             choose_distance = random.uniform(40, 20) if distance>20 else distance
             
@@ -279,7 +279,7 @@ class GUIWorker(object):
             temp_d = self.env.action_transformer.quantizer.discretize(temp_d)
             temp_d = self.env.action_transformer.quantizer.undiscretize(temp_d)
             d1,d2 = temp_d / self.camera_scaler
-            self.move_once(float(d1), float(d2)) #在这里改变了self.cursor[0]
+            self.move_once(float(d1), float(d2)) # This updates self.cursor[0]
             #print(distance,choose_distance,"||",d1,d2,"||")
         #print(x , self.cursor[0],y , self.cursor[1])  
     
@@ -396,7 +396,7 @@ class GUIWorker(object):
         """check what happened now """
         import cv2
         self._null_action()
-        screen_shot = self.outframes[-1] # 现在里面必然有值
+        screen_shot = self.outframes[-1] # Guaranteed to have a value at this point
         cv2.imwrite(store_path, screen_shot)
         print(f"Screenshot saved to {store_path}.")
     

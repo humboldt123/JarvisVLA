@@ -35,7 +35,11 @@ MINESTUDIO_GPU_RENDER=1 python -m minestudio.simulator.entry # using VirtualGL
 
 You can serve the model with vllm to support multi-GPU and multi-process rollout.
 ```sh
-CUDA_VISIBLE_DEVICES=0 vllm serve jarvis_vla_qwen2_vl_7b_sft --port 8000
+#CUDA_VISIBLE_DEVICES=0 vllm serve jarvis_vla_qwen2_vl_7b_sft --port 8000
+#CUDA_VISIBLE_DEVICES=0 vllm serve CraftJarvis/JarvisVLA-Qwen2-VL-7B --port 8000
+
+# allow more ims
+vllm serve CraftJarvis/JarvisVLA-Qwen2-VL-7B --port 8000 --limit-mm-per-prompt image=5
 ```
 
 Then you need to edit the rollout script to the use the correct base_url and port. 

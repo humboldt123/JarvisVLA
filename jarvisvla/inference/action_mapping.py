@@ -369,7 +369,7 @@ class OneActionTokenizer(ActionTokenizer):
         for action in  actions:
             action_dict = {
                 "buttons":np.array([action[0]]),
-                "camera":np.array([action[1]]),  #返回一个工作
+                "camera":np.array([action[1]]),  # Return one action
             }
             action_dict = OrderedDict({key: value[0] for key, value in action_dict.items()})
             action_dicts.append(action_dict)

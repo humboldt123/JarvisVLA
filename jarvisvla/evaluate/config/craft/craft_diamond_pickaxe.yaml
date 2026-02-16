@@ -1,0 +1,31 @@
+defaults:
+  - base
+  - _self_
+
+# Override: no worker, no GUI automation — let the model figure it out
+worker: null
+need_gui: False
+need_crafting_table: False
+
+task_conf:
+  - name: "craft"
+    text: "craft_item:diamond_pickaxe"
+
+reward_conf:
+  - event: "craft_item"
+    max_reward_times: 1
+    reward: 1.0
+    objects:
+      - "diamond_pickaxe"
+    identity: "craft diamond_pickaxe"
+
+init_inventory:
+  - slot: 0
+    type: crafting_table
+    quantity: 1
+  - slot: 14
+    type: diamond
+    quantity: 3
+  - slot: 15
+    type: stick
+    quantity: 2

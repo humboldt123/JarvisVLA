@@ -36,13 +36,13 @@ for task in "${tasks[@]}"; do
             --instruction-type $instruction_type \
             --action-chunk-len $action_chunk_len \
             #--verbos True \
-        # 如果 Python 脚本执行成功，则退出循环
+        # If Python script succeeds, exit the loop
         if [[ $? -eq 0 ]]; then
-            echo "第 $i 次迭代中的 Python 脚本执行成功，退出循环。"
+            echo "Python script succeeded on iteration $i, exiting loop."
             break
         fi
         if [[ $i -lt $((num_iterations - 1)) ]]; then
-            echo "等待 10 秒..."
+            echo "Waiting 10 seconds..."
             sleep 10
         fi
     done
