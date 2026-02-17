@@ -41,6 +41,7 @@ def make_collator(collator_type: str, **kwargs) -> Callable:
     collators = {
         "MultimodalChatDataCollatorforVLM": MultimodalChatDataCollatorforVLM,
         "VLAMultimodalChatDataCollatorforVLM": VLAMultimodalChatDataCollatorforVLM,
+        "VLAInventoryDataCollatorforVLM": VLAInventoryDataCollatorforVLM,
     }
     
     if collator_type in collators:
@@ -293,6 +294,143 @@ class VLAMultimodalChatDataCollatorforVLM(MultimodalChatDataCollatorforVLM):
             DataAugment.CONTRAST,
             DataAugment.TRANSLATE,
         ]
+
+
+class VLAInventoryDataCollatorforVLM(VLAMultimodalChatDataCollatorforVLM):
+    """
+    Extended collator that also processes inventory targets for auxiliary training.
+    
+    This collator extends VLAMultimodalChatDataCollatorforVLM to handle inventory
+    data from the OpenVPT dataset. It expects each example to have an 'inventory'
+    field containing item types and optionally counts.
+    
+    Supports two inventory formats:
+    1. VPT format (default): List of dicts with 'type' and 'quantity' keys
+       {
+           'inventory': [
+               {'type': 'stone_pickaxe', 'quantity': 1},
+               {'type': 'oak_planks', 'quantity': 59},
+               ...
+           ]
+       }
+    
+    2. Simple format: Dict with 'items' and 'counts' lists
+       {
+           'inventory': {
+               'items': [1, 5, 0, ...],  # Item class indices
+               'counts': [1, 32, 0, ...]
+           }
+       }
+    
+    The collator converts to tensors and adds them to the batch as:
+    - 'inventory_items': Tensor of shape (batch_size, num_slots) with item class indices
+    - 'inventory_counts': Tensor of shape (batch_size, num_slots) with item counts
+    
+    Args:
+        num_slots: Number of inventory slots (default: 36 = 9 hotbar + 27 main)
+        empty_slot_idx: Index representing empty slot (default: 0)
+        item_vocabulary: Optional ItemVocabulary instance for mapping item names to indices
+        **kwargs: Additional arguments passed to parent collator
+    """
+    
+    def __init__(self, processor, model_path, num_slots: int = 36, 
+                 empty_slot_idx: int = 0, item_vocabulary=None, **kwargs):
+        super().__init__(processor=processor, model_path=model_path, **kwargs)
+        self.num_slots = num_slots
+        self.empty_slot_idx = empty_slot_idx
+        self.item_vocabulary = item_vocabulary
+    
+    def __call__(self, examples):
+        """
+        Process batch with inventory targets.
+        
+        Args:
+            examples: List of dataset examples, each containing 'conversations', 
+                     'image', and optionally 'inventory'
+        
+        Returns:
+            batch: Dictionary with standard VLA fields plus 'inventory_items' and
+                  optionally 'inventory_counts'
+        """
+        # First, process with parent collator (handles text, images, labels)
+        batch = super().__call__(examples)
+        
+        # Process inventory targets
+        inventory_items = []
+        inventory_counts = []
+        has_inventory = False
+        
+        for example in examples:
+            inv = example.get('inventory', None)
+            
+            if inv is not None:
+                has_inventory = True
+                items, counts = self._process_inventory(inv)
+                inventory_items.append(items)
+                inventory_counts.append(counts)
+            else:
+                # No inventory data for this example - use padding (will be ignored via mask)
+                inventory_items.append([-100] * self.num_slots)  # -100 = ignore
+                inventory_counts.append([0] * self.num_slots)
+        
+        # Convert to tensors
+        if has_inventory:
+            batch['inventory_items'] = torch.tensor(inventory_items, dtype=torch.long)
+            batch['inventory_counts'] = torch.tensor(inventory_counts, dtype=torch.long)
+        
+        return batch
+    
+    def _process_inventory(self, inv_data) -> tuple:
+        """
+        Process inventory data in various formats.
+        
+        Args:
+            inv_data: Inventory data (list of dicts for VPT format, or dict with lists)
+        
+        Returns:
+            items: List of item indices (length = num_slots)
+            counts: List of item counts (length = num_slots)
+        """
+        items = [self.empty_slot_idx] * self.num_slots
+        counts = [0] * self.num_slots
+        
+        # VPT format: list of dicts with 'type' and 'quantity'
+        if isinstance(inv_data, list):
+            for i, item in enumerate(inv_data[:self.num_slots]):
+                if isinstance(item, dict):
+                    item_name = item.get('type', '')
+                    quantity = item.get('quantity', 1)
+                else:
+                    item_name = str(item)
+                    quantity = 1
+                
+                # Clean up item name (remove namespace prefix)
+                if ':' in item_name:
+                    item_name = item_name.split(':')[-1]
+                
+                # Get item index from vocabulary
+                if self.item_vocabulary is not None:
+                    item_idx = self.item_vocabulary.get_item_index(item_name)
+                else:
+                    # Without vocabulary, we can't map names to indices
+                    # This is a fallback that won't work for training
+                    item_idx = self.empty_slot_idx
+                
+                items[i] = item_idx
+                counts[i] = quantity
+        
+        # Simple format: dict with 'items' and 'counts' lists
+        elif isinstance(inv_data, dict):
+            item_list = inv_data.get('items', [])
+            count_list = inv_data.get('counts', [])
+            
+            for i in range(min(len(item_list), self.num_slots)):
+                items[i] = item_list[i]
+                if i < len(count_list):
+                    counts[i] = count_list[i]
+        
+        return items, counts
+
 
 def apply_private_conversations(conversations:list, tokenizer=None):
     """Prepare the text from a sample of the dataset."""
