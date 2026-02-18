@@ -151,7 +151,8 @@ def main():
         seq = train_loader[seq_idx]
         
         chunk_losses = []
-        memory = model_engine.module.init_memory(1, device)
+        # Initialize memory manually (DeepSpeed ZeRO-3 can shard initial_memory incorrectly)
+        memory = torch.zeros(1, args.memory_dim, device=device, dtype=torch.bfloat16)
         
         start_idx = torch.randint(0, max(1, len(seq['frames']) - args.bptt_chunk_size), (1,)).item()
         
