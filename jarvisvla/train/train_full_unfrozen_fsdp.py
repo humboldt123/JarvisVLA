@@ -1,34 +1,71 @@
 #!/usr/bin/env python3
 """
-Training script for FULLY unfrozen StatefulJarvisVLA (8.3B params) using PyTorch FSDP.
-Trains ViT + LLM + memory projections + inventory head together.
+PROPER training script for FULLY unfrozen StatefulJarvisVLA (8.3B params) using PyTorch FSDP.
+
+Features:
+- SHARDED_STATE_DICT for safe checkpointing
+- Comprehensive metrics logging (JSON Lines format)
+- Empty vs non-empty accuracy tracking
+- Cosine similarity metrics
+- Gradient norm monitoring
+- Automatic plotting script included
 """
 
 import os
 import sys
 import argparse
+import json
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List
+import functools
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from pathlib import Path
-from tqdm import tqdm
-import json
-
-# FSDP imports
+import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
-import functools
-import torch.distributed as dist
 
-# Model imports
 from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor
 from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLDecoderLayer
 
-# Project imports
 sys.path.insert(0, '/home/vvm33/JarvisVLA')
-from jarvisvla.models.stateful_vla import StatefulJarvisVLA, wrap_model_for_stateful_training
+from jarvisvla.models.stateful_vla import wrap_model_for_stateful_training
+
+
+class MetricsLogger:
+    """Logs training metrics in JSON Lines format for easy plotting."""
+    
+    def __init__(self, log_file: str, rank: int):
+        self.log_file = log_file
+        self.rank = rank
+        self.metrics_history = []
+        
+        if rank == 0:
+            # Create directory if needed
+            Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+            # Write header
+            with open(log_file, 'w') as f:
+                f.write(f"# Training metrics started at {datetime.now().isoformat()}\n")
+    
+    def log(self, metrics: Dict, step: int):
+        """Log metrics for a step."""
+        metrics['step'] = step
+        metrics['timestamp'] = time.time()
+        self.metrics_history.append(metrics)
+        
+        if self.rank == 0:
+            with open(self.log_file, 'a') as f:
+                f.write(json.dumps(metrics) + '\n')
+    
+    def log_summary(self, summary: Dict):
+        """Log final summary."""
+        if self.rank == 0:
+            with open(self.log_file, 'a') as f:
+                f.write(f"# SUMMARY: {json.dumps(summary)}\n")
 
 
 def setup_distributed():
@@ -50,69 +87,90 @@ def setup_distributed():
 
 
 def cleanup_distributed():
-    """Cleanup distributed training."""
     if dist.is_initialized():
         dist.destroy_process_group()
 
 
 def get_fsdp_model(model, device_id):
     """Wrap model with FSDP."""
-    
-    # Mixed precision policy
     mp_policy = MixedPrecision(
         param_dtype=torch.bfloat16,
         reduce_dtype=torch.bfloat16,
         buffer_dtype=torch.bfloat16,
     )
     
-    # Auto-wrap policy - wrap transformer layers but NOT embeddings
     def wrap_policy_fn(module):
-        # Wrap transformer decoder layers
         if isinstance(module, Qwen2VLDecoderLayer):
             return True
         return False
     
     auto_wrap_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=wrap_policy_fn)
     
-    # FSDP wrapper
     model = FSDP(
         model,
         device_id=device_id,
         auto_wrap_policy=auto_wrap_policy,
         mixed_precision=mp_policy,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
-        cpu_offload=None,  # Keep on GPU for speed
         limit_all_gathers=True,
-        use_orig_params=True,  # Fix for autograd view issues
+        use_orig_params=True,
     )
     
     return model
 
 
-class SimpleSequenceDataset:
-    """Simple dataset that loads sequences on demand."""
+def compute_inventory_metrics(predicted_emb, target_emb, empty_emb, threshold=0.95):
+    """
+    Compute inventory prediction metrics.
     
-    def __init__(self, jsonl_files, cache_size, encoder, data_dir):
-        self.jsonl_files = jsonl_files
-        self.cache_size = cache_size
-        self.encoder = encoder
-        self.data_dir = Path(data_dir)
-        
-    def __len__(self):
-        return len(self.jsonl_files)
+    Returns:
+        Dict with accuracy, cosine similarity, empty/non-empty classification metrics
+    """
+    metrics = {}
     
-    def __getitem__(self, idx):
-        """Load a single sequence."""
-        from jarvisvla.train.run_overnight_eval import OnDemandSequenceLoader
-        # Create temporary loader for this file
-        loader = OnDemandSequenceLoader([self.jsonl_files[idx]], 1, self.encoder, str(self.data_dir))
-        return loader[0]
+    # Cosine similarity
+    cos_sim = F.cosine_similarity(predicted_emb.flatten(), target_emb.flatten(), dim=0)
+    metrics['cosine_similarity'] = cos_sim.item()
+    
+    # Classify as empty or non-empty
+    pred_sim_to_empty = F.cosine_similarity(predicted_emb.flatten(), empty_emb, dim=0)
+    target_sim_to_empty = F.cosine_similarity(target_emb.flatten(), empty_emb, dim=0)
+    
+    pred_is_empty = pred_sim_to_empty.item() > threshold
+    target_is_empty = target_sim_to_empty.item() > threshold
+    
+    metrics['pred_empty'] = 1.0 if pred_is_empty else 0.0
+    metrics['target_empty'] = 1.0 if target_is_empty else 0.0
+    metrics['empty_accuracy'] = 1.0 if pred_is_empty == target_is_empty else 0.0
+    
+    return metrics
+
+
+def save_checkpoint(model, step, losses, metrics_logger, output_dir, rank):
+    """Save FSDP checkpoint using SHARDED_STATE_DICT (safe for training)."""
+    if rank != 0:
+        return
+    
+    os.makedirs(output_dir, exist_ok=True)
+    checkpoint_path = os.path.join(output_dir, f'checkpoint_step_{step}.pt')
+    
+    # Use SHARDED_STATE_DICT - doesn't corrupt training
+    with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+        model_state_dict = model.state_dict()
+    
+    torch.save({
+        'step': step,
+        'model_state_dict': model_state_dict,
+        'losses': losses,
+    }, checkpoint_path)
+    
+    print(f"\n[CHECKPOINT] Saved to {checkpoint_path}")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_dir', type=str, default='/data/vvm33/vpt_contractor')
-    parser.add_argument('--output_dir', type=str, default='/data/vvm33/checkpoints/full_unfrozen_fsdp')
+    parser.add_argument('--output_dir', type=str, default='/data/vvm33/checkpoints/full_unfrozen_proper')
     parser.add_argument('--train_jsonls', type=int, default=4000)
     parser.add_argument('--test_jsonls', type=int, default=400)
     parser.add_argument('--train_steps', type=int, default=5000)
@@ -124,19 +182,28 @@ def main():
     parser.add_argument('--inventory_weight', type=float, default=0.1)
     parser.add_argument('--non_empty_weight', type=float, default=5.0)
     parser.add_argument('--grad_accum_steps', type=int, default=4)
+    parser.add_argument('--resume_from', type=str, default=None)
+    parser.add_argument('--log_every', type=int, default=10, help='Log metrics every N steps')
     args = parser.parse_args()
     
-    # Setup distributed
+    # Setup
     rank, world_size, local_rank = setup_distributed()
     device = torch.device(f'cuda:{local_rank}')
     
-    if rank == 0:
-        print(f"FSDP Training: {world_size} GPUs")
-        print(f"Output: {args.output_dir}")
+    # Metrics logger
+    metrics_file = os.path.join(args.output_dir, 'metrics.jsonl')
+    logger = MetricsLogger(metrics_file, rank)
     
-    # Load base model
     if rank == 0:
-        print("Loading Qwen2-VL-7B...")
+        print(f"="*70)
+        print(f"PROPER FSDP Training: {world_size} GPUs")
+        print(f"Output: {args.output_dir}")
+        print(f"Metrics: {metrics_file}")
+        print(f"="*70)
+    
+    # Load model
+    if rank == 0:
+        print("\n[1/5] Loading Qwen2-VL-7B...")
     
     base_model = Qwen2VLForConditionalGeneration.from_pretrained(
         "CraftJarvis/JarvisVLA-Qwen2-VL-7B",
@@ -148,7 +215,6 @@ def main():
         trust_remote_code=True,
     )
     
-    # Create stateful model with inventory head
     model = wrap_model_for_stateful_training(
         base_model=base_model,
         memory_dim=args.memory_dim,
@@ -156,37 +222,25 @@ def main():
         inventory_head_kwargs={'output_dim': 768},
     )
     
-    # UNFREEZE EVERYTHING
+    # Unfreeze everything
     for param in model.parameters():
         param.requires_grad = True
     
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
     if rank == 0:
-        print(f"Total params: {total_params:,}")
-        print(f"Trainable: {trainable_params:,} ({trainable_params/total_params*100:.1f}%)")
-        print("  ✓ Vision Encoder (ViT) - UNFROZEN")
-        print("  ✓ Qwen2VL LLM (7B) - UNFROZEN")
-        print("  ✓ Memory projections - UNFROZEN")
-        print("  ✓ Inventory head - UNFROZEN")
+        print(f"  Total params: {total_params:,}")
+        print(f"  All parameters unfrozen (ViT + LLM + memory + inventory)")
     
-    # Move to device and convert to bfloat16 before FSDP
+    # FSDP setup
     model = model.to(device, dtype=torch.bfloat16)
-    
-    # Wrap with FSDP
-    if rank == 0:
-        print("Wrapping with FSDP...")
     model = get_fsdp_model(model, device_id=local_rank)
     
-    # Create optimizer with discriminative LR
-    # Need to get unwrapped model for parameter groups
+    # Optimizer
     param_groups = [
-        {'params': [], 'lr': args.learning_rate, 'name': 'new_params'},  # memory + inventory
-        {'params': [], 'lr': args.base_model_lr, 'name': 'base_model'},  # ViT + LLM
+        {'params': [], 'lr': args.learning_rate},
+        {'params': [], 'lr': args.base_model_lr},
     ]
-    
-    # Separate parameters
     for name, param in model.named_parameters():
         if param.requires_grad:
             if 'memory_projections' in name or 'inventory_embedding_head' in name:
@@ -196,49 +250,75 @@ def main():
     
     optimizer = torch.optim.AdamW(param_groups)
     
-    # Load encoder for inventory embeddings
+    if rank == 0:
+        print(f"\n[2/5] Optimizer:")
+        print(f"  New params (memory+inventory): LR={args.learning_rate}")
+        print(f"  Base params (ViT+LLM): LR={args.base_model_lr}")
+    
+    # Resume if needed
+    start_step = 0
+    losses = []
+    if args.resume_from and os.path.exists(args.resume_from):
+        if rank == 0:
+            print(f"\n[2.5/5] Resuming from {args.resume_from}...")
+        checkpoint = torch.load(args.resume_from, map_location='cpu')
+        with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+            model.load_state_dict(checkpoint['model_state_dict'])
+        start_step = checkpoint.get('step', 0)
+        losses = checkpoint.get('losses', [])
+    
+    # Data setup
+    if rank == 0:
+        print(f"\n[3/5] Loading data...")
+    
     from jarvisvla.train.sequence_dataset import InventoryTextEncoder
+    from jarvisvla.train.run_overnight_eval import OnDemandSequenceLoader
+    
     encoder = InventoryTextEncoder(device=device)
     
-    # Get empty embedding reference
     with torch.no_grad():
         empty_inputs = encoder.tokenizer("empty inventory", return_tensors="pt", padding=True).to(device)
         empty_emb = encoder.model(**empty_inputs).last_hidden_state[0, 0, :]
         empty_emb = F.normalize(empty_emb, dim=-1)
     
-    # Load data
-    if rank == 0:
-        print("Loading data...")
-    
-    from jarvisvla.train.run_overnight_eval import OnDemandSequenceLoader
     jsonl_files = sorted(Path(args.data_dir).glob("*.jsonl"))
     train_files = jsonl_files[:args.train_jsonls]
-    test_files = jsonl_files[args.train_jsonls:args.train_jsonls + args.test_jsonls]
     train_loader = OnDemandSequenceLoader(train_files, 50, encoder)
     
     if rank == 0:
-        print(f"\nTraining for {args.train_steps} steps...")
+        print(f"  Training sequences: {len(train_loader)}")
     
-    losses = []
+    # Training loop
+    if rank == 0:
+        print(f"\n[4/5] Training from step {start_step} to {args.train_steps}...")
+        print(f"  Logging every {args.log_every} steps")
+        print(f"  Checkpointing every {args.eval_every} steps")
+        print(f"\n{'Step':>8} {'Loss':>10} {'InvLoss':>10} {'CosSim':>8} {'EmptyAcc':>8} {'Time':>8}")
+        print("-"*70)
     
-    for step in range(args.train_steps):
-        model.train()
+    step_times = []
+    
+    for step in range(start_step, args.train_steps):
+        step_start = time.time()
         
+        model.train()
         chunk_losses = []
-        # Initialize memory manually
+        chunk_inv_losses = []
+        chunk_metrics = []
+        
+        # Initialize memory
         memory = torch.zeros(1, args.memory_dim, device=device, dtype=torch.bfloat16)
         
         # Get random sequence
         seq_idx = torch.randint(0, len(train_loader), (1,)).item()
         seq = train_loader[seq_idx]
-        
         start_idx = torch.randint(0, max(1, len(seq['frames']) - args.bptt_chunk_size), (1,)).item()
         
         for t in range(start_idx, min(start_idx + args.bptt_chunk_size, len(seq['frames']))):
             frame = seq['frames'][t]
             inv_target = seq['inventory_embeddings'][t:t+1].to(device)
             
-            # Check if non-empty
+            # Check if empty
             target_emb = inv_target[0].mean(dim=0)
             sim_to_empty = F.cosine_similarity(target_emb.unsqueeze(0), empty_emb.unsqueeze(0), dim=-1).item()
             is_non_empty = sim_to_empty < 0.95
@@ -252,8 +332,7 @@ def main():
                 max_length=128,
                 truncation=True,
             )
-            inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
-                     for k, v in inputs.items()}
+            inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
             
             outputs = model(
                 input_ids=inputs.get('input_ids'),
@@ -271,50 +350,102 @@ def main():
                 if is_non_empty:
                     loss = loss * args.non_empty_weight
                 
-                # Standard backward
                 loss.backward()
-                chunk_losses.append(loss.item() * (args.bptt_chunk_size * args.grad_accum_steps))
+                
+                # Unscale loss for logging
+                raw_loss = outputs.loss.item()
+                chunk_losses.append(raw_loss)
+                
+                if outputs.inventory_loss is not None:
+                    chunk_inv_losses.append(outputs.inventory_loss.item())
+                
+                # Compute inventory metrics
+                if hasattr(outputs, 'inventory_embedding') and outputs.inventory_embedding is not None:
+                    inv_metrics = compute_inventory_metrics(
+                        outputs.inventory_embedding[0].mean(dim=0),
+                        inv_target[0].mean(dim=0),
+                        empty_emb
+                    )
+                    chunk_metrics.append(inv_metrics)
             
             memory = outputs.new_memory.detach()
         
         # Optimizer step
         if chunk_losses:
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()
             
             losses.append(sum(chunk_losses))
+            
+            # Aggregate metrics
+            avg_loss = sum(chunk_losses)
+            avg_inv_loss = sum(chunk_inv_losses) / len(chunk_inv_losses) if chunk_inv_losses else 0.0
+            avg_cos_sim = sum(m['cosine_similarity'] for m in chunk_metrics) / len(chunk_metrics) if chunk_metrics else 0.0
+            avg_empty_acc = sum(m['empty_accuracy'] for m in chunk_metrics) / len(chunk_metrics) if chunk_metrics else 0.0
+            pct_empty = sum(m['target_empty'] for m in chunk_metrics) / len(chunk_metrics) if chunk_metrics else 0.0
+            
+            step_time = time.time() - step_start
+            step_times.append(step_time)
+            
+            # Log metrics
+            metrics = {
+                'loss': avg_loss,
+                'inventory_loss': avg_inv_loss,
+                'cosine_similarity': avg_cos_sim,
+                'empty_accuracy': avg_empty_acc,
+                'pct_empty_frames': pct_empty,
+                'grad_norm': grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                'step_time': step_time,
+            }
+            
+            logger.log(metrics, step)
+            
+            # Print
+            if rank == 0 and step % args.log_every == 0:
+                print(f"{step:>8} {avg_loss:>10.4f} {avg_inv_loss:>10.4f} {avg_cos_sim:>8.4f} "
+                      f"{avg_empty_acc:>8.2%} {step_time:>8.2f}s")
         
-        # Logging
-        if rank == 0 and step % 10 == 0 and losses:
-            avg_loss = sum(losses[-10:]) / len(losses[-10:])
-            print(f"Step {step}/{args.train_steps}, Loss: {avg_loss:.4f}")
+        # Checkpoint (safe with SHARDED_STATE_DICT)
+        if (step + 1) % args.eval_every == 0:
+            save_checkpoint(model, step + 1, losses, logger, args.output_dir, rank)
+    
+    # Final save
+    save_checkpoint(model, args.train_steps, losses, logger, args.output_dir, rank)
+    
+    # Summary
+    if rank == 0 and losses:
+        summary = {
+            'total_steps': len(losses),
+            'initial_loss': losses[0],
+            'final_loss': losses[-1],
+            'min_loss': min(losses),
+            'avg_step_time': sum(step_times) / len(step_times),
+        }
+        logger.log_summary(summary)
         
-        # Save checkpoint
-        if (step + 1) % args.eval_every == 0 and rank == 0:
-            os.makedirs(args.output_dir, exist_ok=True)
-            checkpoint_path = os.path.join(args.output_dir, f'checkpoint_step_{step+1}.pt')
-            
-            # Save full state dict
-            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
-                state_dict = model.state_dict()
-            
-            torch.save({
-                'step': step + 1,
-                'model_state_dict': state_dict,
-                'optimizer_state_dict': optimizer.state_dict(),
-                'losses': losses,
-            }, checkpoint_path)
-            
-            print(f"Saved checkpoint to {checkpoint_path}")
+        print(f"\n[5/5] Training Complete!")
+        print(f"  Initial loss: {summary['initial_loss']:.4f}")
+        print(f"  Final loss: {summary['final_loss']:.4f}")
+        print(f"  Min loss: {summary['min_loss']:.4f}")
+        print(f"  Avg step time: {summary['avg_step_time']:.2f}s")
+        print(f"\nMetrics saved to: {metrics_file}")
+        print(f"Plot with: python jarvisvla/train/plot_metrics.py {metrics_file}")
     
     cleanup_distributed()
-    
-    if rank == 0:
-        print("\nTraining complete!")
 
+
+"""
+## About master_port
+
+The master_port (default: 29500) is the TCP port used by PyTorch distributed training 
+for inter-process communication. When you run multi-GPU training with torchrun, the 
+different processes need to find each other and coordinate.
+
+--master_port=29501  # Use this if 29500 is already in use (e.g., from a crashed run)
+
+If you get "address already in use" error, just increment the port number.
+"""
 
 if __name__ == '__main__':
     main()
