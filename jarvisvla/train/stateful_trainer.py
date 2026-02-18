@@ -38,10 +38,41 @@ Training Loop (with chunk_size=16):
 import torch
 import torch.nn as nn
 from typing import Dict, Optional, List, Tuple, Any, Iterator
-from transformers import Trainer
+from transformers import Trainer, AutoTokenizer, AutoModel
 from transformers.trainer_utils import EvalPrediction
 import numpy as np
 from torch.utils.data import DataLoader, IterableDataset
+
+
+class CachedBertEncoder:
+    """Singleton BERT encoder for inventory embeddings to avoid reloading."""
+    _instance = None
+    
+    def __new__(cls, device='cuda'):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+            cls._instance.model = AutoModel.from_pretrained("bert-base-uncased").to(device)
+            cls._instance.model.eval()
+            cls._instance.device = device
+            # Cache empty inventory embedding
+            with torch.no_grad():
+                inputs = cls._instance.tokenizer("empty inventory", return_tensors="pt", padding=True).to(device)
+                empty_emb = cls._instance.model(**inputs).last_hidden_state[0, 0, :]
+                cls._instance.empty_emb = torch.nn.functional.normalize(empty_emb, dim=-1)
+        return cls._instance
+    
+    def get_empty_embedding(self):
+        return self.empty_emb
+    
+    def encode(self, texts):
+        """Batch encode texts."""
+        with torch.no_grad():
+            inputs = self.tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=128).to(self.device)
+            outputs = self.model(**inputs)
+            # Use [CLS] token
+            embeddings = outputs.last_hidden_state[:, 0, :]
+            return torch.nn.functional.normalize(embeddings, dim=-1)
 
 
 class StatefulVLATrainer(Trainer):
@@ -77,10 +108,19 @@ class StatefulVLATrainer(Trainer):
         self.max_grad_norm = max_grad_norm
         self.non_empty_loss_weight = non_empty_loss_weight
         
+        # Cache BERT encoder for empty inventory detection (singleton)
+        self._bert_encoder = None
+        
         # Enable gradient checkpointing on base model if available
         if hasattr(self.model, 'base_model') and hasattr(self.model.base_model, 'gradient_checkpointing_enable'):
             self.model.base_model.gradient_checkpointing_enable()
             print("[StatefulVLATrainer] Gradient checkpointing enabled on base model")
+    
+    def _get_bert_encoder(self, device):
+        """Get cached BERT encoder."""
+        if self._bert_encoder is None:
+            self._bert_encoder = CachedBertEncoder(device)
+        return self._bert_encoder
     
     def compute_loss(
         self,
@@ -326,19 +366,9 @@ class StatefulVLATrainer(Trainer):
         batch_size, seq_len, emb_dim = inventory_embeddings.shape
         device = inventory_embeddings.device
         
-        # Create "empty inventory" embedding on the fly
-        # We could cache this, but computing it once per batch is fine
-        from transformers import AutoTokenizer, AutoModel
-        
-        # Load BERT on the same device
-        tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-        model = AutoModel.from_pretrained("bert-base-uncased").to(device)
-        model.eval()
-        
-        with torch.no_grad():
-            inputs = tokenizer("empty inventory", return_tensors="pt", padding=True).to(device)
-            empty_emb = model(**inputs).last_hidden_state[0, 0, :]  # [768]
-            empty_emb = torch.nn.functional.normalize(empty_emb, dim=-1)
+        # Use cached BERT encoder (much faster than loading every time)
+        bert_encoder = self._get_bert_encoder(device)
+        empty_emb = bert_encoder.get_empty_embedding()
         
         # Compute similarity to empty template for all frames
         # inventory_embeddings is already normalized
@@ -350,10 +380,6 @@ class StatefulVLATrainer(Trainer):
         
         # Non-empty if similarity to empty is low
         is_non_empty = similarity_to_empty < empty_threshold
-        
-        # Clean up
-        del model
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
         return is_non_empty
     
@@ -451,7 +477,9 @@ class StatefulVLATrainer(Trainer):
                                 torch.tensor(self.non_empty_loss_weight, dtype=step_loss.dtype, device=step_loss.device),
                                 torch.tensor(1.0, dtype=step_loss.dtype, device=step_loss.device)
                             )
-                            step_loss = step_loss * frame_weight.mean()  # Average across batch
+                            # Apply per-sample weighting, then take mean
+                            # step_loss is [batch], frame_weight is [batch]
+                            step_loss = (step_loss * frame_weight).mean()  # Weighted average across batch
                         
                         chunk_loss = chunk_loss + step_loss
                     

@@ -49,6 +49,12 @@ def parse_args():
     parser.add_argument("--bptt_chunk_size", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--non_empty_loss_weight", type=float, default=5.0)
+    parser.add_argument("--max_eval_seqs", type=int, default=50,
+                       help="Max sequences to evaluate (for speed)")
+    parser.add_argument("--eval_every_steps", type=int, default=1000,
+                       help="Run evaluation every N steps")
+    parser.add_argument("--early_stopping_patience", type=int, default=5,
+                       help="Stop if no improvement for N evaluations")
     
     # Model
     parser.add_argument("--model_name", type=str, default="CraftJarvis/JarvisVLA-Qwen2-VL-7B")
@@ -262,10 +268,19 @@ def load_model(model_name, memory_dim, device):
     return model, processor
 
 
-def evaluate_model(model, sequences, processor, encoder, device):
-    """Evaluate model on sequences."""
+def evaluate_model(model, sequences, processor, encoder, device, max_eval_seqs=50):
+    """Evaluate model on sequences (sampled for speed)."""
     model.eval()
     model.train_aux_heads(True)
+    
+    # Sample sequences for evaluation
+    import random
+    total_seqs = len(sequences)
+    if total_seqs > max_eval_seqs:
+        eval_indices = random.sample(range(total_seqs), max_eval_seqs)
+        print(f"  Sampling {max_eval_seqs}/{total_seqs} sequences for evaluation")
+    else:
+        eval_indices = range(total_seqs)
     
     results = {
         'empty_correct': 0,
@@ -286,8 +301,9 @@ def evaluate_model(model, sequences, processor, encoder, device):
         empty_emb = F.normalize(empty_emb, dim=-1).to(model_device)
     
     with torch.no_grad():
-        for seq_idx, seq in enumerate(sequences):
-            print(f"  Sequence {seq_idx+1}/{len(sequences)}...", end='\r')
+        for eval_idx, seq_idx in enumerate(eval_indices):
+            seq = sequences[seq_idx]
+            print(f"  Sequence {eval_idx+1}/{len(eval_indices)}...", end='\r')
             
             memory = model.init_memory(1, model_device)
             
@@ -370,48 +386,70 @@ def compute_metrics(results):
     }
 
 
-def train_model(model, train_seqs, processor, encoder, args, device):
-    """Train model for specified steps."""
+def train_model(model, train_seqs, test_seqs, processor, encoder, args, device):
+    """Train model for specified steps with early stopping."""
     print(f"\nTraining for {args.train_steps} steps...")
+    print(f"  Eval every: {args.eval_every_steps} steps")
+    print(f"  Early stopping patience: {args.early_stopping_patience} evaluations")
     
     model.train()
     model.train_aux_heads(True)
     
-    # Note: Gradient checkpointing disabled for compatibility
-    # Memory management via small BPTT chunks and periodic cache clearing
+    # UNFREEZE BASE MODEL: Allow inventory gradients to flow through entire 7B model
+    print("Unfreezing base model - inventory gradients will flow through entire model")
+    for name, param in model.named_parameters():
+        if 'base_model' in name:
+            param.requires_grad = True
     
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.learning_rate
-    )
+    # Discriminative learning rates: new params at higher LR, base at lower LR
+    # This prevents catastrophic forgetting while allowing adaptation
+    new_params = []
+    base_params = []
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if 'memory_projections' in name or 'inventory_embedding_head' in name:
+                new_params.append(param)
+            elif 'base_model' in name:
+                base_params.append(param)
     
-    # Get model device for all tensors
+    base_lr = args.learning_rate / 10  # 10x lower for base model (e.g., 5e-5 vs 5e-4)
+    optimizer = torch.optim.AdamW([
+        {'params': new_params, 'lr': args.learning_rate, 'name': 'new'},
+        {'params': base_params, 'lr': base_lr, 'name': 'base'},
+    ])
+    
+    print(f"  New params (memory + head): {len(new_params)} groups, LR={args.learning_rate}")
+    print(f"  Base model params: {len(base_params)} groups, LR={base_lr}")
+    
     model_device = next(model.parameters()).device
     
-    # Get empty embedding (on encoder device, then move to model device)
+    # Get empty embedding
     with torch.no_grad():
         empty_inputs = encoder.tokenizer("empty inventory", return_tensors="pt", padding=True).to(encoder.device)
         empty_emb = encoder.model(**empty_inputs).last_hidden_state[0, 0, :]
         empty_emb = F.normalize(empty_emb, dim=-1).to(model_device)
     
     losses = []
+    main_losses = []  # Track main LM loss for catastrophic forgetting detection
+    inv_losses = []   # Track inventory loss
+    eval_history = []  # Track evaluation scores for early stopping
+    best_score = -float('inf')
+    patience_counter = 0
     
     for step in range(args.train_steps):
-        # Pick random sequence (on-demand loading via index)
+        # Pick random sequence
         seq_idx = np.random.randint(0, len(train_seqs))
         seq = train_seqs[seq_idx]
         
         chunk_losses = []
         memory = model.init_memory(args.batch_size, model_device)
         
-        # Random start within sequence
         start_idx = np.random.randint(0, max(1, len(seq['frames']) - args.bptt_chunk_size))
         
         for t in range(start_idx, min(start_idx + args.bptt_chunk_size, len(seq['frames']))):
             frame = seq['frames'][t]
             inv_target = seq['inventory_embeddings'][t:t+1].to(model_device)
             
-            # Check if non-empty
             target_emb = inv_target[0].mean(dim=0)
             sim_to_empty = F.cosine_similarity(target_emb.unsqueeze(0), empty_emb.unsqueeze(0), dim=-1).item()
             is_non_empty = sim_to_empty < 0.95
@@ -437,37 +475,117 @@ def train_model(model, train_seqs, processor, encoder, args, device):
                 inventory_embeddings=inv_target,
             )
             
+            # Diagnostics for first 10 steps
+            if step < 10:
+                main_loss_val = outputs.main_loss.item() if outputs.main_loss is not None else 0.0
+                inv_loss_val = outputs.inventory_loss.item() if outputs.inventory_loss is not None else 0.0
+                ratio = inv_loss_val / main_loss_val if main_loss_val > 0 else 0.0
+                print(f"  [Step {step+1} Diagnostics] main_loss={main_loss_val:.4f}, "
+                      f"inventory_loss={inv_loss_val:.4f}, ratio={ratio:.6f}, "
+                      f"has_inv_emb={outputs.inventory_embedding is not None}")
+            
             if outputs.loss is not None:
                 step_loss = outputs.loss / args.bptt_chunk_size
                 
-                # Apply weighting
                 if is_non_empty:
                     step_loss = step_loss * args.non_empty_loss_weight
                 
                 chunk_losses.append(step_loss)
+                
+                # Track separate losses for monitoring
+                if outputs.main_loss is not None:
+                    main_losses.append(outputs.main_loss.item())
+                if outputs.inventory_loss is not None:
+                    inv_losses.append(outputs.inventory_loss.item())
             
-            # Detach memory between steps (BPTT)
             memory = outputs.new_memory.detach()
         
-        # Sum losses and backward
         if chunk_losses:
             chunk_loss = sum(chunk_losses)
             chunk_loss.backward()
+            
+            # Gradient verification for first step
+            if step == 0:
+                print("\n  [Gradient Check] Checking gradient flow...")
+                has_grad_memory = False
+                has_grad_inventory = False
+                for name, param in model.named_parameters():
+                    if param.grad is not None and param.grad.abs().sum() > 0:
+                        if 'memory_projections' in name:
+                            has_grad_memory = True
+                            print(f"    ✓ {name}: grad_norm={param.grad.norm().item():.4f}")
+                        elif 'inventory_embedding_head' in name:
+                            has_grad_inventory = True
+                            print(f"    ✓ {name}: grad_norm={param.grad.norm().item():.4f}")
+                if not has_grad_memory:
+                    print("    ✗ WARNING: No gradients flowing to memory_projections!")
+                if not has_grad_inventory:
+                    print("    ✗ WARNING: No gradients flowing to inventory_embedding_head!")
+                print()
+            
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()
             losses.append(chunk_loss.item())
         
-        # Clear CUDA cache to prevent OOM
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
+        # Log progress
         if (step + 1) % 100 == 0:
             avg_loss = np.mean(losses[-100:]) if losses else 0.0
-            print(f"  Step {step+1}/{args.train_steps}: avg_loss={avg_loss:.4f}")
+            avg_main = np.mean(main_losses[-100:]) if main_losses else 0.0
+            avg_inv = np.mean(inv_losses[-100:]) if inv_losses else 0.0
+            print(f"  Step {step+1}/{args.train_steps}: total={avg_loss:.4f}, "
+                  f"main={avg_main:.4f}, inv={avg_inv:.4f}")
         
-        # Save checkpoint every 200 steps
-        if (step + 1) % 200 == 0 and args.output_dir:
+        # Evaluation and checkpointing
+        if (step + 1) % args.eval_every_steps == 0:
+            print(f"\n  Running evaluation at step {step+1}...")
+            eval_results = evaluate_model(model, test_seqs, processor, encoder, device,
+                                         max_eval_seqs=args.max_eval_seqs)
+            eval_metrics = compute_metrics(eval_results)
+            
+            # Use non-empty cosine similarity as the key metric
+            current_score = eval_metrics['non_empty_cos']
+            eval_history.append({'step': step + 1, 'score': current_score, 'metrics': eval_metrics})
+            
+            print(f"  Eval score (non-empty cos): {current_score:.4f}")
+            
+            # Early stopping check
+            if current_score > best_score:
+                improvement = current_score - best_score
+                best_score = current_score
+                patience_counter = 0
+                print(f"  New best! Improvement: +{improvement:.4f}")
+                
+                # Save best checkpoint
+                if args.output_dir:
+                    best_path = os.path.join(args.output_dir, 'checkpoint_best.pt')
+                    torch.save({
+                        'step': step + 1,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'losses': losses,
+                        'eval_metrics': eval_metrics,
+                        'args': vars(args),
+                    }, best_path)
+                    print(f"  Best checkpoint saved: {best_path}")
+            else:
+                patience_counter += 1
+                print(f"  No improvement ({patience_counter}/{args.early_stopping_patience})")
+                
+                if patience_counter >= args.early_stopping_patience:
+                    print(f"\n  Early stopping triggered at step {step+1}")
+                    print(f"  Best score: {best_score:.4f}")
+                    break
+            
+            # Resume training mode
+            model.train()
+            model.train_aux_heads(True)
+        
+        # Save regular checkpoint every 200 steps (in addition to best)
+        elif (step + 1) % 200 == 0 and args.output_dir:
             checkpoint_path = os.path.join(args.output_dir, f'checkpoint_step_{step+1}.pt')
             torch.save({
                 'step': step + 1,
@@ -479,7 +597,8 @@ def train_model(model, train_seqs, processor, encoder, args, device):
             print(f"  Checkpoint saved: {checkpoint_path}")
     
     print(f"Training complete. Final loss: {losses[-1]:.4f}")
-    return losses
+    print(f"Best eval score: {best_score:.4f}")
+    return losses, eval_history
 
 
 def print_results_table(baseline_metrics, trained_metrics, save_path=None):
@@ -564,7 +683,7 @@ def main():
     print("\n" + "="*70)
     print("3. BASELINE EVALUATION (BEFORE TRAINING)")
     print("="*70)
-    baseline_results = evaluate_model(model, test_seqs, processor, encoder, device)
+    baseline_results = evaluate_model(model, test_seqs, processor, encoder, device, args.max_eval_seqs)
     baseline_metrics = compute_metrics(baseline_results)
     
     print(f"\nBaseline metrics:")
@@ -578,11 +697,15 @@ def main():
     print("\n" + "="*70)
     print("4. TRAINING")
     print("="*70)
-    train_losses = train_model(model, train_seqs, processor, encoder, args, device)
+    train_losses, eval_history = train_model(model, train_seqs, test_seqs, processor, encoder, args, device)
     
     # Save training curve
     with open(os.path.join(args.output_dir, 'train_losses.json'), 'w') as f:
         json.dump(train_losses, f)
+    
+    # Save evaluation history
+    with open(os.path.join(args.output_dir, 'eval_history.json'), 'w') as f:
+        json.dump(eval_history, f, indent=2)
     
     # Save checkpoint
     checkpoint_path = os.path.join(args.output_dir, 'trained_model.pt')
@@ -596,7 +719,7 @@ def main():
     print("\n" + "="*70)
     print("5. POST-TRAINING EVALUATION")
     print("="*70)
-    trained_results = evaluate_model(model, test_seqs, processor, encoder, device)
+    trained_results = evaluate_model(model, test_seqs, processor, encoder, device, args.max_eval_seqs)
     trained_metrics = compute_metrics(trained_results)
     
     print(f"\nTrained metrics:")
