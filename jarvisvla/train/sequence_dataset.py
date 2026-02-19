@@ -40,6 +40,7 @@ from typing import Dict, List, Optional, Tuple, Iterator
 import numpy as np
 from PIL import Image
 import cv2
+cv2.setLogLevel(0)  # suppress ffmpeg "moov atom not found" spam from truncated VPT files
 from transformers import AutoTokenizer, AutoModel
 
 
@@ -184,8 +185,73 @@ class InventoryTextEncoder:
         
         # Normalize
         embeddings = F.normalize(embeddings, p=2, dim=-1)
-        
+
         return embeddings
+
+    def _slot_to_text(self, slot_data: Dict) -> str:
+        """
+        Convert a single inventory slot to a canonical text string.
+
+        Current format: "oak_log count:1"
+        NBT metadata can be appended here later without touching the head
+        architecture, e.g. "diamond_pickaxe count:1 sharpness:1 unbreaking:3".
+        """
+        item_type = slot_data.get('type', '')
+        quantity = slot_data.get('quantity', 0)
+        if item_type and item_type != 'air' and quantity > 0:
+            if ':' in item_type:
+                item_type = item_type.split(':')[-1]
+            return f"{item_type} count:{quantity}"
+        return "empty slot"
+
+    @staticmethod
+    def inventory_has_items(inventory_list: List[Dict]) -> bool:
+        """Return True if any slot contains a non-air item."""
+        return any(
+            item.get('type', '') not in ('', 'air') and item.get('quantity', 0) > 0
+            for item in inventory_list
+        )
+
+    @torch.no_grad()
+    def encode_inventory_per_slot(
+        self,
+        inventory_list: List[Dict],
+        num_slots: int = 36,
+    ) -> torch.Tensor:
+        """
+        Encode each inventory slot independently.
+
+        Returns [num_slots, 768] where every slot has its own BERT embedding.
+        Slot assignment uses the 'slot' field if present, else list order.
+
+        NBT-extensible: modify _slot_to_text() to include enchantments,
+        durability, etc. without changing the head architecture at all.
+
+        Args:
+            inventory_list: List of {type, quantity, slot?, ...} dicts
+            num_slots: Number of inventory slots (default: 36 for Minecraft)
+
+        Returns:
+            embeddings: [num_slots, 768] normalized per-slot embeddings
+        """
+        slot_texts = ["empty slot"] * num_slots
+        for i, item in enumerate(inventory_list):
+            slot_idx = item.get('slot', i)
+            if isinstance(slot_idx, int) and 0 <= slot_idx < num_slots:
+                slot_texts[slot_idx] = self._slot_to_text(item)
+            elif i < num_slots:
+                slot_texts[i] = self._slot_to_text(item)
+
+        inputs = self.tokenizer(
+            slot_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=64,
+        ).to(self.device)
+        outputs = self.model(**inputs)
+        embeddings = outputs.last_hidden_state[:, 0, :]  # [num_slots, 768]
+        return F.normalize(embeddings, p=2, dim=-1)
 
 
 class VPTSequenceDataset(IterableDataset):
@@ -341,24 +407,27 @@ class VPTSequenceDataset(IterableDataset):
         # Generate text prompts
         texts = self._generate_texts(ticks)
         
-        # Encode inventory with BERT
+        # Encode inventory with BERT — per-slot: [seq_len, 36, 768]
         if self.inventory_encoder is not None:
-            inventory_embeddings = []
-            for tick_data in ticks:
-                inv_emb = self.inventory_encoder.encode_inventory(tick_data['inventory'])
-                inventory_embeddings.append(inv_emb)
-            inventory_embeddings = torch.stack(inventory_embeddings)  # [seq_len, 768]
+            inventory_embeddings = torch.stack([
+                self.inventory_encoder.encode_inventory_per_slot(t['inventory'])
+                for t in ticks
+            ])
+            inventory_has_items = [
+                InventoryTextEncoder.inventory_has_items(t['inventory']) for t in ticks
+            ]
         else:
-            # Fallback: dummy embeddings
-            inventory_embeddings = torch.zeros(len(ticks), 768)
-        
+            inventory_embeddings = torch.zeros(len(ticks), 36, 768)
+            inventory_has_items = [False] * len(ticks)
+
         # Extract actions
         actions = [tick_data['mouse'] for tick_data in ticks]
-        
+
         return {
             'frames': frames,
             'texts': texts,
             'inventory_embeddings': inventory_embeddings,
+            'inventory_has_items': inventory_has_items,
             'actions': actions,
             'video_path': video_path,
             'start_tick': ticks[0]['tick'],
@@ -461,7 +530,7 @@ class VPTSequenceDataCollator:
             - pixel_values: [batch, seq_len, ...]
             - input_ids: [batch, seq_len, max_seq_length]
             - labels: [batch, seq_len, max_seq_length]
-            - inventory_embeddings: [batch, seq_len, 768]
+            - inventory_embeddings: [batch, seq_len, 36, 768]
             - attention_mask: [batch, seq_len, max_seq_length]
         """
         batch_size = len(examples)
@@ -571,3 +640,135 @@ def create_sequence_dataloaders(
     )
     
     return train_loader, None
+
+
+class OnDemandSequenceLoader:
+    """
+    Loads VPT sequences on-demand to avoid OOM during training.
+
+    Builds a lightweight index over JSONL/MP4 pairs — only line counts,
+    no frames or embeddings in memory.  Sequences are loaded from disk on
+    __getitem__ and kept in a small LRU cache.
+
+    Each returned sequence dict contains:
+        frames: List[PIL.Image]  (length = sequence_length)
+        inventory_embeddings: [seq_len, 36, 768]  per-slot BERT targets
+        inventory_has_items: List[bool]  cheap non-empty flag (no BERT needed at train time)
+        ticks: List[dict]  raw JSONL tick data
+        source_file: str
+    """
+
+    def __init__(
+        self,
+        jsonl_files: List[Path],
+        sequence_length: int,
+        encoder: InventoryTextEncoder,
+        cache_size: int = 10,
+    ):
+        self.jsonl_files = jsonl_files
+        self.sequence_length = sequence_length
+        self.encoder = encoder
+        self.cache: Dict = {}
+        self.cache_size = cache_size
+        # index: list of (jsonl_idx, num_sequences_in_file)
+        self.index: List[Tuple[int, int]] = []
+
+        for jsonl_idx, jsonl_file in enumerate(jsonl_files):
+            mp4_file = jsonl_file.with_suffix('.mp4')
+            if not mp4_file.exists():
+                continue
+            tick_count = 0
+            with open(jsonl_file, 'r', encoding='utf-8', errors='ignore') as f:
+                for _ in f:
+                    tick_count += 1
+            num_seqs = max(0, (tick_count - sequence_length) // sequence_length + 1)
+            if num_seqs > 0:
+                self.index.append((jsonl_idx, num_seqs))
+
+    def __len__(self) -> int:
+        return sum(count for _, count in self.index)
+
+    def __getitem__(self, idx: int) -> Dict:
+        if idx in self.cache:
+            return self.cache[idx]
+        current = 0
+        for jsonl_idx, count in self.index:
+            if idx < current + count:
+                seq = self._load_sequence(jsonl_idx, idx - current)
+                if len(self.cache) >= self.cache_size:
+                    self.cache.pop(next(iter(self.cache)))
+                self.cache[idx] = seq
+                return seq
+            current += count
+        raise IndexError(f"Index {idx} out of range (loader has {len(self)} sequences)")
+
+    def _load_sequence(self, jsonl_idx: int, seq_in_file: int) -> Dict:
+        jsonl_file = self.jsonl_files[jsonl_idx]
+        mp4_file = jsonl_file.with_suffix('.mp4')
+        start_tick = seq_in_file * self.sequence_length
+
+        ticks = []
+        with open(jsonl_file, 'r', encoding='utf-8', errors='ignore') as f:
+            for i, line in enumerate(f):
+                if i < start_tick:
+                    continue
+                if i >= start_tick + self.sequence_length:
+                    break
+                try:
+                    data = json.loads(line)
+                    ticks.append({
+                        'tick': data.get('tick', i),
+                        'inventory': data.get('inventory', []),
+                        'mouse': data.get('mouse', {}),
+                        'keyboard': data.get('keyboard', {}),
+                        'isGuiOpen': data.get('isGuiOpen', False),
+                        'isGuiInventory': data.get('isGuiInventory', False),
+                        'hotbar': data.get('hotbar', 0),
+                        'yaw': data.get('yaw', 0.0),
+                        'pitch': data.get('pitch', 0.0),
+                    })
+                except json.JSONDecodeError:
+                    continue
+
+        cap = cv2.VideoCapture(str(mp4_file))
+        frames = []
+        if cap.isOpened():
+            for i in range(start_tick, start_tick + self.sequence_length):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+                ret, frame = cap.read()
+                if ret:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frame = cv2.resize(frame, (224, 224))
+                    frames.append(Image.fromarray(frame))
+        cap.release()
+        # Pad with black frames if video was truncated or had a bad moov atom
+        while len(frames) < self.sequence_length:
+            frames.append(Image.new('RGB', (224, 224), color='black'))
+
+        # Per-slot BERT targets: [seq_len, 36, 768]
+        inv_embs = torch.stack([
+            self.encoder.encode_inventory_per_slot(t['inventory']) for t in ticks
+        ])
+        # Cheap non-empty flag — avoids cosine similarity comparison at training time
+        has_items = [InventoryTextEncoder.inventory_has_items(t['inventory']) for t in ticks]
+
+        # Human-readable per-slot texts for eval display: List[List[str]] (seq_len, 36)
+        slot_texts_per_tick = []
+        for t in ticks:
+            slot_texts = ["empty slot"] * 36
+            for i, item in enumerate(t['inventory']):
+                slot_idx = item.get('slot', i)
+                if isinstance(slot_idx, int) and 0 <= slot_idx < 36:
+                    slot_texts[slot_idx] = self.encoder._slot_to_text(item)
+                elif i < 36:
+                    slot_texts[i] = self.encoder._slot_to_text(item)
+            slot_texts_per_tick.append(slot_texts)
+
+        return {
+            'frames': frames,
+            'inventory_embeddings': inv_embs,
+            'inventory_has_items': has_items,
+            'inventory_slot_texts': slot_texts_per_tick,
+            'ticks': ticks,
+            'source_file': jsonl_file.name,
+        }

@@ -27,7 +27,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType, FullStateDictConfig
 
 from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor
 from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLDecoderLayer
@@ -146,25 +146,191 @@ def compute_inventory_metrics(predicted_emb, target_emb, empty_emb, threshold=0.
     return metrics
 
 
+def evaluate_on_test_set(model, test_loader, processor, args, device, rank, logger):
+    """
+    End-of-training evaluation on held-out test sequences.
+
+    All FSDP ranks must call this — FSDP all-gathers on every forward pass.
+    Only rank 0 prints and logs.
+
+    Metrics logged:
+        eval_cos_sim           mean per-slot cosine sim over all test frames
+        eval_non_empty_cos_sim same, restricted to frames that have items
+        eval_non_empty_pct     fraction of test frames with a non-empty inventory
+    """
+    num_seqs = len(test_loader)
+    if rank == 0:
+        print(f"\n[5/5] Evaluating on {num_seqs} test sequences "
+              f"({num_seqs * 50} frames)...")
+
+    model.eval()
+    model.train_aux_heads(True)       # re-enable aux head for inference
+    if model.inventory_embedding_head is not None:
+        model.inventory_embedding_head.eval()   # keep dropout off
+
+    total_cos = 0.0
+    non_empty_cos = 0.0
+    n_total = 0
+    n_non_empty = 0
+    # rank 0 collects vocab + display examples for NN-decoded output
+    vocab_set: set = set()
+    display_examples: List[Dict] = []
+
+    with torch.no_grad():
+        for seq_idx in range(num_seqs):
+            if rank == 0 and seq_idx % 5 == 0:
+                print(f"  seq {seq_idx + 1}/{num_seqs} ...", end='\r', flush=True)
+
+            seq = test_loader[seq_idx]
+            memory = torch.zeros(1, args.memory_dim, device=device, dtype=torch.bfloat16)
+
+            for t in range(len(seq['frames'])):
+                frame = seq['frames'][t]
+                inv_target = seq['inventory_embeddings'][t:t+1].to(device)
+                is_non_empty = seq['inventory_has_items'][t]
+                slot_texts   = seq.get('inventory_slot_texts', [[]] * len(seq['frames']))[t]
+
+                chat_text = processor.apply_chat_template(
+                    [{"role": "user", "content": [
+                        {"type": "image", "image": frame},
+                        {"type": "text", "text": "What is in the inventory?"},
+                    ]}],
+                    tokenize=False, add_generation_prompt=True,
+                )
+                inputs = processor(text=chat_text, images=[frame], return_tensors="pt")
+                inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                          for k, v in inputs.items()}
+
+                outputs = model(
+                    input_ids=inputs.get('input_ids'),
+                    pixel_values=inputs.get('pixel_values'),
+                    image_grid_thw=inputs.get('image_grid_thw'),
+                    prev_memory=memory,
+                    attention_mask=inputs.get('attention_mask'),
+                    labels=None,
+                    inventory_embeddings=inv_target,
+                )
+
+                if outputs.inventory_embedding is not None:
+                    pred   = outputs.inventory_embedding[0]  # [36, 768] — inventory head
+                    target = inv_target[0]                   # [36, 768]
+                    per_slot_cos = (pred * target).sum(dim=-1)  # [36]
+                    cos_sim = per_slot_cos.mean().item()
+                    total_cos += cos_sim
+                    n_total += 1
+                    if is_non_empty:
+                        non_empty_cos += cos_sim
+                        n_non_empty += 1
+
+                    if rank == 0:
+                        # Accumulate vocab for NN decoding (all non-empty slot texts seen)
+                        for txt in slot_texts:
+                            if txt != "empty slot":
+                                vocab_set.add(txt)
+
+                        # Collect up to 3 non-empty frames for display
+                        if is_non_empty and len(display_examples) < 3:
+                            display_examples.append({
+                                'source': seq.get('source_file', '?'),
+                                'tick': t,
+                                'mean_cos': cos_sim,
+                                # (slot_idx, gt_text, pred_emb_cpu, cos_sim_for_slot)
+                                'slots': [
+                                    (i, slot_texts[i],
+                                     pred[i].float().cpu(),
+                                     per_slot_cos[i].item())
+                                    for i in range(len(slot_texts))
+                                    if slot_texts[i] != "empty slot"
+                                ],
+                            })
+
+                memory = outputs.new_memory.detach()
+
+    avg_cos          = total_cos    / max(n_total,     1)
+    avg_ne_cos       = non_empty_cos / max(n_non_empty, 1)
+    non_empty_pct    = 100.0 * n_non_empty / max(n_total, 1)
+
+    eval_metrics = {
+        'eval_cos_sim':           avg_cos,
+        'eval_non_empty_cos_sim': avg_ne_cos,
+        'eval_non_empty_pct':     non_empty_pct,
+        'eval_n_frames':          n_total,
+        'eval_seqs':              num_seqs,
+    }
+    logger.log_summary({'final_eval': eval_metrics})
+
+    if rank == 0:
+        print(f"\n{'='*70}")
+        print(f"TEST SET EVALUATION  ({num_seqs} seqs, {n_total} frames)")
+        print(f"{'='*70}")
+        print(f"  All frames    avg cosine sim : {avg_cos:.4f}")
+        print(f"  Non-empty     avg cosine sim : {avg_ne_cos:.4f}"
+              f"  ({n_non_empty}/{n_total} frames = {non_empty_pct:.1f}%)")
+
+        if display_examples and vocab_set:
+            # BERT-encode the vocabulary once for nearest-neighbour decoding
+            enc = test_loader.encoder
+            vocab_list = sorted(vocab_set)
+            vocab_inputs = enc.tokenizer(
+                vocab_list, return_tensors="pt",
+                padding=True, truncation=True, max_length=64,
+            ).to(enc.device)
+            with torch.no_grad():
+                vocab_embs = enc.model(**vocab_inputs).last_hidden_state[:, 0, :]
+                vocab_embs = F.normalize(vocab_embs, p=2, dim=-1)  # [V, 768]
+            vocab_embs_cpu = vocab_embs.cpu()
+
+            print(f"\n--- Inventory head: ground truth → NN-decoded prediction ---")
+            print(f"    (predictions decoded by nearest-neighbour in BERT space)")
+            for ex in display_examples:
+                gt_items  = {txt for _, txt, _, _ in ex['slots']}
+                pred_items: set = set()
+
+                print(f"\n  [{ex['source']}  tick {ex['tick']}]  mean cos_sim={ex['mean_cos']:.3f}")
+                for slot_idx, gt_text, pred_emb, cs in ex['slots']:
+                    sims     = (pred_emb.unsqueeze(0) @ vocab_embs_cpu.T).squeeze(0)
+                    pred_text = vocab_list[sims.argmax().item()]
+                    pred_items.add(pred_text)
+                    match = '✓' if pred_text == gt_text else '✗'
+                    bar   = '█' * int(cs * 20) + '░' * (20 - int(cs * 20))
+                    print(f"    slot {slot_idx:>2}  GT: {gt_text:<28}  "
+                          f"PRED: {pred_text:<28}  {bar} {cs:.3f} {match}")
+
+                # Jaccard over the item-name sets for this frame
+                if gt_items or pred_items:
+                    jaccard = len(gt_items & pred_items) / len(gt_items | pred_items)
+                    print(f"           Jaccard (item sets): {jaccard:.2f}"
+                          f"  GT={sorted(gt_items)}  PRED={sorted(pred_items)}")
+
+        print(f"{'='*70}")
+
+    return eval_metrics
+
+
 def save_checkpoint(model, step, losses, metrics_logger, output_dir, rank):
-    """Save FSDP checkpoint using SHARDED_STATE_DICT (safe for training)."""
-    if rank != 0:
-        return
-    
-    os.makedirs(output_dir, exist_ok=True)
-    checkpoint_path = os.path.join(output_dir, f'checkpoint_step_{step}.pt')
-    
-    # Use SHARDED_STATE_DICT - doesn't corrupt training
-    with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+    """Save FSDP checkpoint using FULL_STATE_DICT.
+
+    All ranks must call this — FSDP all-gathers the full model to rank 0's CPU.
+    rank0_only=True means ranks 1+ return empty dicts and don't hold the full
+    weights in memory, so there's no OOM risk on non-rank-0 GPUs.
+    """
+    if rank == 0:
+        os.makedirs(output_dir, exist_ok=True)
+        checkpoint_path = os.path.join(output_dir, f'checkpoint_step_{step}.pt')
+    else:
+        checkpoint_path = None
+
+    cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
         model_state_dict = model.state_dict()
-    
-    torch.save({
-        'step': step,
-        'model_state_dict': model_state_dict,
-        'losses': losses,
-    }, checkpoint_path)
-    
-    print(f"\n[CHECKPOINT] Saved to {checkpoint_path}")
+
+    if rank == 0:
+        torch.save({
+            'step': step,
+            'model_state_dict': model_state_dict,
+            'losses': losses,
+        }, checkpoint_path)
+        print(f"\n[CHECKPOINT] Saved to {checkpoint_path}")
 
 
 def main():
@@ -262,7 +428,8 @@ def main():
         if rank == 0:
             print(f"\n[2.5/5] Resuming from {args.resume_from}...")
         checkpoint = torch.load(args.resume_from, map_location='cpu')
-        with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
             model.load_state_dict(checkpoint['model_state_dict'])
         start_step = checkpoint.get('step', 0)
         losses = checkpoint.get('losses', [])
@@ -271,8 +438,7 @@ def main():
     if rank == 0:
         print(f"\n[3/5] Loading data...")
     
-    from jarvisvla.train.sequence_dataset import InventoryTextEncoder
-    from jarvisvla.train.run_overnight_eval import OnDemandSequenceLoader
+    from jarvisvla.train.sequence_dataset import InventoryTextEncoder, OnDemandSequenceLoader
     
     encoder = InventoryTextEncoder(device=device)
     
@@ -283,10 +449,13 @@ def main():
     
     jsonl_files = sorted(Path(args.data_dir).glob("*.jsonl"))
     train_files = jsonl_files[:args.train_jsonls]
+    test_files  = jsonl_files[args.train_jsonls:args.train_jsonls + args.test_jsonls]
     train_loader = OnDemandSequenceLoader(train_files, 50, encoder)
-    
+    test_loader  = OnDemandSequenceLoader(test_files,  50, encoder)
+
     if rank == 0:
         print(f"  Training sequences: {len(train_loader)}")
+        print(f"  Test sequences:     {len(test_loader)}  (files {args.train_jsonls}–{args.train_jsonls + args.test_jsonls})")
     
     # Training loop
     if rank == 0:
@@ -306,21 +475,9 @@ def main():
         chunk_losses = []
         chunk_inv_losses = []
         chunk_metrics = []
-        last_answer_text = ""
-        
-        # Initialize memory
+
+        # Initialize memory for this BPTT chunk
         memory = torch.zeros(1, args.memory_dim, device=device, dtype=torch.bfloat16)
-        
-        # Random phrases for inventory text generation
-        INV_PHRASES = [
-            "My inventory consists of",
-            "The contents of my inventory are",
-            "I have in my possession",
-            "Currently carrying",
-            "In my backpack I have",
-            "My items include",
-            "I am holding",
-        ]
         
         # Get random sequence
         seq_idx = torch.randint(0, len(train_loader), (1,)).item()
@@ -331,157 +488,108 @@ def main():
             frame = seq['frames'][t]
             inv_target = seq['inventory_embeddings'][t:t+1].to(device)
             
-            # Get raw inventory data for text generation
-            raw_inventory = seq['ticks'][t]['inventory'] if 'ticks' in seq else []
-            
-            # Check if empty
-            target_emb = inv_target[0].mean(dim=0)
-            sim_to_empty = F.cosine_similarity(target_emb.unsqueeze(0), empty_emb.unsqueeze(0), dim=-1).item()
-            is_non_empty = sim_to_empty < 0.95
-            
-            # Generate text label from inventory data
-            # Format: "[random phrase]: [count] [item][plural?], ..."
-            if raw_inventory:
-                phrase = INV_PHRASES[torch.randint(0, len(INV_PHRASES), (1,)).item()]
-                items_text = []
-                for item in raw_inventory:
-                    name = item.get('type', 'unknown')
-                    count = item.get('quantity', 1)
-                    plural = 's' if count > 1 and not name.endswith('s') else ''
-                    items_text.append(f"{count} {name}{plural}")
-                answer_text = f"{phrase}: {', '.join(items_text)}"
-            else:
-                answer_text = "My inventory is empty"
-            
-            # Forward
-            inputs = processor(
-                text="What is in the inventory?",
-                images=frame,
-                return_tensors="pt",
-                padding='max_length',
-                max_length=128,
-                truncation=True,
+            # Check whether this frame has a non-empty inventory (for loss weighting)
+            is_non_empty = seq['inventory_has_items'][t]
+
+            chat_text = processor.apply_chat_template(
+                [{"role": "user", "content": [
+                    {"type": "image", "image": frame},
+                    {"type": "text", "text": "What is in the inventory?"},
+                ]}],
+                tokenize=False, add_generation_prompt=True,
             )
+            inputs = processor(text=chat_text, images=[frame], return_tensors="pt")
             inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-            
-            # CRITICAL DESIGN CHOICE:
-            # We intentionally set labels=None to DISABLE language modeling loss.
-            # The text "What is in the inventory?" is just a prompt to process the image,
-            # but we DON'T have ground truth text answers ("You have: sword, dirt...").
-            # Using labels=input_ids would train the model to predict the QUESTION text,
-            # not the inventory contents! Instead, we ONLY train on the auxiliary
-            # inventory embedding head which learns to predict BERT embeddings of
-            # the actual inventory state. This is a workaround for having no text labels.
-            
-            # NEW APPROACH: Generate text labels from inventory data!
-            # Instead of training on embeddings only, we generate synthetic text answers
-            # from the structured inventory data. Format:
-            # "[random phrase] [item count] [item name] [plural?], ..."
-            # Examples:
-            #   "My inventory consists of: 5 dirt, 1 sword, 3 planks"
-            #   "The contents of my inventory are: 2 apples, 1 pickaxe"
-            # Random phrases: "My inventory consists of", "The contents of my inventory are",
-            #                 "I have in my possession", "Currently carrying:", etc.
-            # Item format: "{count} {name}{'s' if count>1 else ''}"
-            # labels=None,  # DISABLED - we don't have ground truth text answers!
-            
-            # Tokenize the answer text to use as labels
-            answer_inputs = processor(
-                text=answer_text,
-                return_tensors="pt",
-                padding='max_length',
-                max_length=128,
-                truncation=True,
-            )
-            labels = answer_inputs['input_ids'].to(device)
-            last_answer_text = answer_text  # Save for logging
-            
+
+            # LM supervision disabled (labels=None): the VPT dataset has no paired
+            # text answers, so we train exclusively on the inventory embedding head.
             outputs = model(
                 input_ids=inputs.get('input_ids'),
                 pixel_values=inputs.get('pixel_values'),
                 image_grid_thw=inputs.get('image_grid_thw'),
                 prev_memory=memory,
                 attention_mask=inputs.get('attention_mask'),
-                labels=labels,  # Now using generated answer text!
+                labels=None,
+                inventory_loss_weight=args.inventory_weight,
                 inventory_embeddings=inv_target,
             )
-            
-            # Combined loss: main LM loss + auxiliary inventory loss
-            # Main loss comes from predicting the answer text ("My inventory consists of...")
-            # Inventory loss comes from matching BERT embeddings
-            if outputs.loss is not None:
-                loss = outputs.loss / (args.bptt_chunk_size * args.grad_accum_steps)
-                
-                if is_non_empty:
-                    loss = loss * args.non_empty_weight
-                
-                loss.backward()
-                
-                # Log losses
-                raw_loss = outputs.loss.item()
-                chunk_losses.append(raw_loss)
-                
-                if outputs.inventory_loss is not None:
-                    chunk_inv_losses.append(outputs.inventory_loss.item())
-                
-                # Compute inventory metrics
-                if hasattr(outputs, 'inventory_embedding') and outputs.inventory_embedding is not None:
+
+            if outputs.inventory_loss is not None:
+                # Reconstruct loss from components so non_empty_weight scales only
+                # the inventory term, not the memory regularization.
+                memory_reg = 0.01 * (outputs.new_memory ** 2).mean()
+                inv_ne_weight = args.non_empty_weight if is_non_empty else 1.0
+                scale = args.bptt_chunk_size * args.grad_accum_steps
+                step_loss = (memory_reg + args.inventory_weight * inv_ne_weight * outputs.inventory_loss) / scale
+                step_loss.backward()
+
+                chunk_losses.append(step_loss.item() * scale)  # store unscaled for logging
+                chunk_inv_losses.append(outputs.inventory_loss.item())
+
+                if outputs.inventory_embedding is not None:
                     inv_metrics = compute_inventory_metrics(
                         outputs.inventory_embedding[0].mean(dim=0),
                         inv_target[0].mean(dim=0),
                         empty_emb
                     )
                     chunk_metrics.append(inv_metrics)
-            
+
             memory = outputs.new_memory.detach()
         
-        # Optimizer step
-        if chunk_losses:
+        # Gradient accumulation: accumulate for grad_accum_steps outer steps before
+        # updating.  The loss is already divided by (bptt_chunk_size * grad_accum_steps)
+        # so after grad_accum_steps steps the effective batch covers
+        # grad_accum_steps * bptt_chunk_size timesteps.
+        is_update_step = (
+            ((step - start_step + 1) % args.grad_accum_steps == 0)
+            or (step + 1 == args.train_steps)
+        )
+
+        grad_norm = None
+        if is_update_step and chunk_losses:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()
-            
+
+        if chunk_losses:
             losses.append(sum(chunk_losses))
-            
-            # Aggregate metrics
+
             avg_loss = sum(chunk_losses)
             avg_inv_loss = sum(chunk_inv_losses) / len(chunk_inv_losses) if chunk_inv_losses else 0.0
             avg_cos_sim = sum(m['cosine_similarity'] for m in chunk_metrics) / len(chunk_metrics) if chunk_metrics else 0.0
             avg_empty_acc = sum(m['empty_accuracy'] for m in chunk_metrics) / len(chunk_metrics) if chunk_metrics else 0.0
             pct_empty = sum(m['target_empty'] for m in chunk_metrics) / len(chunk_metrics) if chunk_metrics else 0.0
-            
+
             step_time = time.time() - step_start
             step_times.append(step_time)
-            
-            # Log metrics
+
             metrics = {
                 'loss': avg_loss,
                 'inventory_loss': avg_inv_loss,
                 'cosine_similarity': avg_cos_sim,
                 'empty_accuracy': avg_empty_acc,
                 'pct_empty_frames': pct_empty,
-                'grad_norm': grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                'grad_norm': grad_norm.item() if isinstance(grad_norm, torch.Tensor) else (grad_norm or 0.0),
                 'step_time': step_time,
+                'is_update_step': is_update_step,
             }
-            
+
             logger.log(metrics, step)
-            
-            # Print
+
             if rank == 0 and step % args.log_every == 0:
                 print(f"{step:>8} {avg_loss:>10.4f} {avg_inv_loss:>10.4f} {avg_cos_sim:>8.4f} "
                       f"{avg_empty_acc:>8.2%} {step_time:>8.2f}s")
-                
-                # Occasionally show example answer text
-                if step % 50 == 0 and last_answer_text:
-                    print(f"         Example: {last_answer_text[:80]}...")
-        
-        # Checkpoint (safe with SHARDED_STATE_DICT)
+
+        # Checkpoint
         if (step + 1) % args.eval_every == 0:
             save_checkpoint(model, step + 1, losses, logger, args.output_dir, rank)
     
     # Final save
     save_checkpoint(model, args.train_steps, losses, logger, args.output_dir, rank)
-    
+
+    # Final evaluation on held-out test set
+    eval_metrics = evaluate_on_test_set(model, test_loader, processor, args, device, rank, logger)
+
     # Summary
     if rank == 0 and losses:
         summary = {
@@ -500,6 +608,9 @@ def main():
         print(f"  Avg step time: {summary['avg_step_time']:.2f}s")
         print(f"\nMetrics saved to: {metrics_file}")
         print(f"Plot with: python jarvisvla/train/plot_metrics.py {metrics_file}")
+        if eval_metrics:
+            print(f"  Eval cosine sim (all):       {eval_metrics['eval_cos_sim']:.4f}")
+            print(f"  Eval cosine sim (non-empty): {eval_metrics['eval_non_empty_cos_sim']:.4f}")
     
     cleanup_distributed()
 

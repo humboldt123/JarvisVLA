@@ -12,6 +12,7 @@ from jarvisvla.train.sequence_dataset import (
     InventoryTextEncoder,
     VPTSequenceDataset,
     VPTSequenceDataCollator,
+    OnDemandSequenceLoader,
 )
 
 from jarvisvla.train.stateful_trainer import (
@@ -28,6 +29,7 @@ __all__ = [
     'InventoryTextEncoder',
     'VPTSequenceDataset',
     'VPTSequenceDataCollator',
+    'OnDemandSequenceLoader',
     # Trainer
     'StatefulVLATrainer',
     'SequenceDataCollator',
