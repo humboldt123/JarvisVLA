@@ -302,12 +302,25 @@ def main():
         step_start = time.time()
         
         model.train()
+        model.train_aux_heads(True)  # Enable inventory head
         chunk_losses = []
         chunk_inv_losses = []
         chunk_metrics = []
+        last_answer_text = ""
         
         # Initialize memory
         memory = torch.zeros(1, args.memory_dim, device=device, dtype=torch.bfloat16)
+        
+        # Random phrases for inventory text generation
+        INV_PHRASES = [
+            "My inventory consists of",
+            "The contents of my inventory are",
+            "I have in my possession",
+            "Currently carrying",
+            "In my backpack I have",
+            "My items include",
+            "I am holding",
+        ]
         
         # Get random sequence
         seq_idx = torch.randint(0, len(train_loader), (1,)).item()
@@ -318,10 +331,27 @@ def main():
             frame = seq['frames'][t]
             inv_target = seq['inventory_embeddings'][t:t+1].to(device)
             
+            # Get raw inventory data for text generation
+            raw_inventory = seq['ticks'][t]['inventory'] if 'ticks' in seq else []
+            
             # Check if empty
             target_emb = inv_target[0].mean(dim=0)
             sim_to_empty = F.cosine_similarity(target_emb.unsqueeze(0), empty_emb.unsqueeze(0), dim=-1).item()
             is_non_empty = sim_to_empty < 0.95
+            
+            # Generate text label from inventory data
+            # Format: "[random phrase]: [count] [item][plural?], ..."
+            if raw_inventory:
+                phrase = INV_PHRASES[torch.randint(0, len(INV_PHRASES), (1,)).item()]
+                items_text = []
+                for item in raw_inventory:
+                    name = item.get('type', 'unknown')
+                    count = item.get('quantity', 1)
+                    plural = 's' if count > 1 and not name.endswith('s') else ''
+                    items_text.append(f"{count} {name}{plural}")
+                answer_text = f"{phrase}: {', '.join(items_text)}"
+            else:
+                answer_text = "My inventory is empty"
             
             # Forward
             inputs = processor(
@@ -334,16 +364,51 @@ def main():
             )
             inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
             
+            # CRITICAL DESIGN CHOICE:
+            # We intentionally set labels=None to DISABLE language modeling loss.
+            # The text "What is in the inventory?" is just a prompt to process the image,
+            # but we DON'T have ground truth text answers ("You have: sword, dirt...").
+            # Using labels=input_ids would train the model to predict the QUESTION text,
+            # not the inventory contents! Instead, we ONLY train on the auxiliary
+            # inventory embedding head which learns to predict BERT embeddings of
+            # the actual inventory state. This is a workaround for having no text labels.
+            
+            # NEW APPROACH: Generate text labels from inventory data!
+            # Instead of training on embeddings only, we generate synthetic text answers
+            # from the structured inventory data. Format:
+            # "[random phrase] [item count] [item name] [plural?], ..."
+            # Examples:
+            #   "My inventory consists of: 5 dirt, 1 sword, 3 planks"
+            #   "The contents of my inventory are: 2 apples, 1 pickaxe"
+            # Random phrases: "My inventory consists of", "The contents of my inventory are",
+            #                 "I have in my possession", "Currently carrying:", etc.
+            # Item format: "{count} {name}{'s' if count>1 else ''}"
+            # labels=None,  # DISABLED - we don't have ground truth text answers!
+            
+            # Tokenize the answer text to use as labels
+            answer_inputs = processor(
+                text=answer_text,
+                return_tensors="pt",
+                padding='max_length',
+                max_length=128,
+                truncation=True,
+            )
+            labels = answer_inputs['input_ids'].to(device)
+            last_answer_text = answer_text  # Save for logging
+            
             outputs = model(
                 input_ids=inputs.get('input_ids'),
                 pixel_values=inputs.get('pixel_values'),
                 image_grid_thw=inputs.get('image_grid_thw'),
                 prev_memory=memory,
                 attention_mask=inputs.get('attention_mask'),
-                labels=inputs.get('input_ids'),
+                labels=labels,  # Now using generated answer text!
                 inventory_embeddings=inv_target,
             )
             
+            # Combined loss: main LM loss + auxiliary inventory loss
+            # Main loss comes from predicting the answer text ("My inventory consists of...")
+            # Inventory loss comes from matching BERT embeddings
             if outputs.loss is not None:
                 loss = outputs.loss / (args.bptt_chunk_size * args.grad_accum_steps)
                 
@@ -352,7 +417,7 @@ def main():
                 
                 loss.backward()
                 
-                # Unscale loss for logging
+                # Log losses
                 raw_loss = outputs.loss.item()
                 chunk_losses.append(raw_loss)
                 
@@ -405,6 +470,10 @@ def main():
             if rank == 0 and step % args.log_every == 0:
                 print(f"{step:>8} {avg_loss:>10.4f} {avg_inv_loss:>10.4f} {avg_cos_sim:>8.4f} "
                       f"{avg_empty_acc:>8.2%} {step_time:>8.2f}s")
+                
+                # Occasionally show example answer text
+                if step % 50 == 0 and last_answer_text:
+                    print(f"         Example: {last_answer_text[:80]}...")
         
         # Checkpoint (safe with SHARDED_STATE_DICT)
         if (step + 1) % args.eval_every == 0:
