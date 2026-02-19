@@ -60,37 +60,58 @@ def plot_series(ax, steps, values, label, color, title, ylabel, logy=False, hlin
     ax.grid(True, alpha=0.3)
 
 
+def make_random_walk(losses, step=1.0):
+    """Random walk seeded at the first valid loss value, stepping ±U(0, step) each step."""
+    rng = np.random.default_rng()
+    rw = [None] * len(losses)
+    first = next((i for i, v in enumerate(losses) if v is not None), None)
+    if first is None:
+        return rw
+    rw[first] = losses[first]
+    for i in range(first + 1, len(losses)):
+        rw[i] = rw[i - 1] + rng.uniform(-step, step)
+    return rw
+
+
 def create_plot(metrics, output_file):
     steps      = [m['step']                        for m in metrics]
     losses     = [m.get('loss')                    for m in metrics]
+    lm_losses  = [m['lm_loss']  if m.get('lm_loss',  0) > 0 else None for m in metrics]
     type_losses= [m['type_loss'] if m.get('type_loss', 0) > 0 else None for m in metrics]
     cnt_losses = [m['count_loss'] if m.get('count_loss', 0) > 0 else None for m in metrics]
-    grad_norms = [m.get('grad_norm', 0)            for m in metrics]
     step_times = [m.get('step_time', 0)            for m in metrics]
 
-    # filter out None for log-scale safety
-    def nz(lst):
-        return [v if (v is not None and v > 0) else float('nan') for v in lst]
+    rw_losses  = make_random_walk(cnt_losses, step=0.3)
 
-    fig, axes = plt.subplots(3, 2, figsize=(16, 14))
-    fig.suptitle('JarvisVLA Training — type/count inventory heads', fontsize=14, fontweight='bold')
+    fig, axes = plt.subplots(4, 2, figsize=(16, 18))
+    fig.suptitle('JarvisVLA Training — LM + type/count inventory heads', fontsize=14, fontweight='bold')
 
-    plot_series(axes[0,0], steps, losses,      'loss',      'steelblue',  'Total Loss',             'Loss',      logy=True)
-    plot_series(axes[0,1], steps, type_losses, 'type_loss', 'darkorchid', 'Type Loss (InfoNCE)',     'Loss',      logy=False)
-    plot_series(axes[1,0], steps, cnt_losses,  'cnt_loss',  'seagreen',   'Count Loss (log-MSE)',    'Loss',      logy=False)
-    # Grad norm only meaningful on optimizer update steps
+    # Row 0
+    plot_series(axes[0,0], steps, losses,      'loss',      'steelblue',  'Total Loss',                    'Loss',    logy=True)
+    plot_series(axes[0,1], steps, lm_losses,   'lm_loss',   'darkorange', 'LM Loss (inventory description CE)', 'Loss', logy=False)
+
+    # Row 1
+    plot_series(axes[1,0], steps, type_losses, 'type_loss', 'darkorchid', 'Type Loss (InfoNCE)',            'Loss',    logy=False)
+    plot_series(axes[1,1], steps, cnt_losses,  'cnt_loss',  'seagreen',   'Count Loss (log-MSE)',           'Loss',    logy=False)
+
+    # Row 2 — grad norm + random walk reference for count loss
     update_steps_gn = [m['step'] for m in metrics if m.get('is_update_step') and m.get('grad_norm', 0) > 0]
     update_gn_vals  = [m['grad_norm'] for m in metrics if m.get('is_update_step') and m.get('grad_norm', 0) > 0]
-    ax = axes[1,1]
+    ax = axes[2,0]
     if update_steps_gn:
         ax.scatter(update_steps_gn, update_gn_vals, s=12, color='tomato', alpha=0.5, zorder=3)
-        sm_gn = smooth(update_gn_vals)
-        ax.plot(update_steps_gn, sm_gn, color='tomato', linewidth=2)
+        ax.plot(update_steps_gn, smooth(update_gn_vals), color='tomato', linewidth=2)
     ax.set_xlabel('Step')
     ax.set_ylabel('Norm')
     ax.set_title('Gradient Norm (update steps only)')
     ax.grid(True, alpha=0.3)
-    plot_series(axes[2,0], steps, step_times,  'time',      'gray',       'Step Time',               'Seconds',   logy=False)
+
+    plot_series(axes[2,1], steps, rw_losses, 'rw', 'slategray',
+                'Random ±0.3/step Walk ref\n(same start, same axis as count loss)', 'Loss', logy=False)
+    axes[2,1].set_ylim(axes[1,1].get_ylim())
+
+    # Row 3 — step time + summary
+    plot_series(axes[3,1], steps, step_times, 'time', 'gray', 'Step Time', 'Seconds', logy=False)
 
     # Update-step markers on loss plot
     update_steps = [m['step'] for m in metrics if m.get('is_update_step')]
@@ -99,29 +120,34 @@ def create_plot(metrics, output_file):
         axes[0,0].scatter(update_steps, update_losses, s=8, color='red', zorder=5, alpha=0.4, label='Update step')
         axes[0,0].legend(fontsize=8)
 
-    # Stats panel
-    ax = axes[2,1]
+    ax = axes[3,0]
     ax.axis('off')
     valid_losses = [v for v in losses if v is not None]
+    valid_lm     = [v for v in lm_losses  if v is not None]
     valid_type   = [v for v in type_losses if v is not None]
     valid_cnt    = [v for v in cnt_losses  if v is not None]
     lines = [
-        f"Steps logged:    {len(metrics)}",
+        f"Steps logged:     {len(metrics)}",
         f"Loss  init/final: {valid_losses[0]:.4f} → {valid_losses[-1]:.4f}",
         f"Loss  min:        {min(valid_losses):.4f}",
     ]
+    if valid_lm:
+        lines += [
+            f"LMLoss  avg:      {np.mean(valid_lm):.4f}",
+            f"LMLoss  min:      {min(valid_lm):.4f}",
+        ]
     if valid_type:
         lines += [
-            f"TypeLoss avg:    {np.mean(valid_type):.4f}",
-            f"TypeLoss min:    {min(valid_type):.4f}",
+            f"TypeLoss avg:     {np.mean(valid_type):.4f}",
+            f"TypeLoss min:     {min(valid_type):.4f}",
         ]
     if valid_cnt:
         lines += [
-            f"CntLoss  avg:    {np.mean(valid_cnt):.4f}",
-            f"CntLoss  min:    {min(valid_cnt):.4f}",
+            f"CntLoss  avg:     {np.mean(valid_cnt):.4f}",
+            f"CntLoss  min:     {min(valid_cnt):.4f}",
         ]
     if step_times:
-        lines.append(f"Avg step time:   {np.mean(step_times):.2f}s")
+        lines.append(f"Avg step time:    {np.mean(step_times):.2f}s")
     ax.text(0.05, 0.95, '\n'.join(lines), transform=ax.transAxes,
             fontsize=11, verticalalignment='top', fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))

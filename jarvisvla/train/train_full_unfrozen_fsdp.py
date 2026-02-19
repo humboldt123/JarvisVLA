@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Dict, List
 import functools
 
+import random
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -35,6 +37,53 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLDecoderLayer
 
 sys.path.insert(0, '/home/vvm33/JarvisVLA')
 from jarvisvla.models.stateful_vla import wrap_model_for_stateful_training
+
+
+# ---------------------------------------------------------------------------
+# LM supervision: inventory description prompts
+#
+# Ideally this model predicts *actions* (move, attack, craft, place, etc.) —
+# that's what a VLA does, and that's how we'll fine-tune once we have
+# action-annotated data.  For this pre-training stage we don't have those
+# labels, so instead we supervise the backbone to *describe the inventory*
+# in plain English.
+#
+# Why bother?  Without any LM loss the inventory aux-head gradient must
+# backprop through 32 transformer layers with nothing anchoring the backbone,
+# which causes it to vanish.  Having the model output text keeps all language
+# pathways active and gives the aux-head gradient a well-conditioned residual
+# stream to ride on top of.
+#
+# The question prompt and answer prefix are sampled randomly from short lists
+# so the model can't short-circuit by memorising the question string.
+# ---------------------------------------------------------------------------
+INVENTORY_QUESTION_PROMPTS = [
+    "What is in the inventory?",
+    "List the items in my inventory.",
+    "What am I currently carrying?",
+    "Describe my inventory contents.",
+    "What items do I have with me right now?",
+    "Give me an inventory summary.",
+]
+
+INVENTORY_ANSWER_PREFIXES = [
+    "My inventory contains:",
+    "I am currently carrying:",
+    "The inventory holds:",
+    "I have the following items:",
+    "Current inventory contents:",
+]
+
+
+def build_inventory_answer(slot_type_texts, slot_counts, prefix):
+    """Build a plain-English description of the current inventory state."""
+    items = []
+    for text, count in zip(slot_type_texts, slot_counts):
+        if text != 'empty slot' and int(count) > 0:
+            items.append(f"{text} x{int(count)}")
+    if items:
+        return f"{prefix} {', '.join(items)}."
+    return f"{prefix} nothing."
 
 
 class MetricsLogger:
@@ -367,8 +416,10 @@ def main():
                         help='Scale factor on the InfoNCE type loss')
     parser.add_argument('--count_weight', type=float, default=0.1,
                         help='Scale factor on the count MSE loss')
-    parser.add_argument('--inv_temperature', type=float, default=0.07,
-                        help='InfoNCE temperature (lower = sharper, like CLIP default)')
+    parser.add_argument('--inv_temperature', type=float, default=0.5,
+                        help='InfoNCE temperature for inventory type loss')
+    parser.add_argument('--lm_weight', type=float, default=1.0,
+                        help='Weight for LM (inventory description) loss; 0 disables it')
     parser.add_argument('--grad_accum_steps', type=int, default=4)
     parser.add_argument('--resume_from', type=str, default=None)
     parser.add_argument('--log_every', type=int, default=10, help='Log metrics every N steps')
@@ -479,8 +530,8 @@ def main():
         print(f"\n[4/5] Training from step {start_step} to {args.train_steps}...")
         print(f"  Logging every {args.log_every} steps")
         print(f"  Checkpointing every {args.eval_every} steps")
-        print(f"\n{'Step':>8} {'Loss':>10} {'TypeLoss':>10} {'CntLoss':>10} {'Time':>8}")
-        print("-"*55)
+        print(f"\n{'Step':>8} {'Loss':>10} {'LMLoss':>10} {'TypeLoss':>10} {'CntLoss':>10} {'Time':>8}")
+        print("-"*66)
     
     step_times = []
     
@@ -490,6 +541,7 @@ def main():
         model.train()
         model.train_aux_heads(True)  # Enable inventory head
         chunk_losses = []
+        chunk_lm_losses = []
         chunk_type_losses = []
         chunk_count_losses = []
 
@@ -506,15 +558,37 @@ def main():
             inv_type_target  = seq['inventory_embeddings'][t:t+1].to(device, dtype=torch.bfloat16)  # [1, 36, 768]
             inv_count_target = seq['inventory_counts'][t:t+1].to(device)      # [1, 36] long
 
+            # Build inventory description for LM supervision.
+            # Random question + prefix so the model can't short-circuit on phrasing.
+            question      = random.choice(INVENTORY_QUESTION_PROMPTS)
+            answer_prefix = random.choice(INVENTORY_ANSWER_PREFIXES)
+            slot_type_texts_t = seq.get(
+                'inventory_slot_texts',
+                [['empty slot'] * 36] * len(seq['frames']),
+            )[t]
+            slot_counts_cpu = seq['inventory_counts'][t].tolist()
+            answer = build_inventory_answer(slot_type_texts_t, slot_counts_cpu, answer_prefix)
+
+            # Full conversation (user + assistant) — model learns to generate the answer.
             chat_text = processor.apply_chat_template(
-                [{"role": "user", "content": [
-                    {"type": "image", "image": frame},
-                    {"type": "text", "text": "What is in the inventory?"},
-                ]}],
-                tokenize=False, add_generation_prompt=True,
+                [
+                    {"role": "user", "content": [
+                        {"type": "image", "image": frame},
+                        {"type": "text", "text": question},
+                    ]},
+                    {"role": "assistant", "content": answer},
+                ],
+                tokenize=False, add_generation_prompt=False,
             )
             inputs = processor(text=chat_text, images=[frame], return_tensors="pt")
             inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+
+            # Label mask: -100 for all prompt/image tokens; only supervise answer tokens.
+            # We tokenize the answer in isolation to count its tokens, then mask the prefix.
+            n_ans  = len(processor.tokenizer(answer, add_special_tokens=False)['input_ids'])
+            labels = inputs['input_ids'].clone()
+            labels[:, :-n_ans] = -100
+            labels = labels.to(device)
 
             outputs = model(
                 input_ids=inputs.get('input_ids'),
@@ -522,11 +596,16 @@ def main():
                 image_grid_thw=inputs.get('image_grid_thw'),
                 prev_memory=memory,
                 attention_mask=inputs.get('attention_mask'),
-                labels=None,
+                labels=labels,
             )
 
             memory_reg = 0.01 * (outputs.new_memory ** 2).mean()
             step_loss = memory_reg / scale  # base: always backprop memory reg
+
+            # LM loss: outputs.main_loss is CE only (memory_reg already in step_loss above).
+            if outputs.main_loss is not None and args.lm_weight > 0:
+                step_loss = step_loss + args.lm_weight * outputs.main_loss / scale
+                chunk_lm_losses.append(outputs.main_loss.item())
 
             if outputs.inventory_embedding is not None:
                 pred_type  = outputs.inventory_embedding[0]   # [36, 768]
@@ -537,18 +616,36 @@ def main():
                 non_empty = tgt_count > 0                      # [36] bool mask
                 N_ne = int(non_empty.sum().item())
 
-                # --- Type loss: InfoNCE over non-empty slots in this frame ---
-                # N_ne non-empty slots form (pred, target) pairs; all other pairs
-                # in the [N_ne × N_ne] similarity matrix are negatives.
+                # --- Type loss: InfoNCE over unique item types in this frame ---
+                # pred and tgt are already L2-normalised by the inventory head.
+                # We deduplicate by target embedding before forming the similarity
+                # matrix: if two slots share the same item type their trigram
+                # embeddings are bit-identical, which would create contradictory
+                # gradients (push pred[i] toward V AND away from V simultaneously).
+                # Dedup removes all but the first occurrence so every off-diagonal
+                # entry in the matrix is a genuinely different item type.
                 if N_ne >= 2:
-                    ne_pred = pred_type[non_empty]             # [N_ne, 768]
-                    ne_tgt  = tgt_type[non_empty]              # [N_ne, 768]
-                    logits  = (ne_pred @ ne_tgt.T) / args.inv_temperature
-                    labels_t = torch.arange(N_ne, device=device)
-                    type_loss = F.cross_entropy(logits, labels_t)
+                    ne_pred = pred_type[non_empty]   # [N_ne, 768] unit vectors
+                    ne_tgt  = tgt_type[non_empty]    # [N_ne, 768] unit vectors
+
+                    # Drop duplicate item types (cos_sim > 0.999 → identical trigram emb)
+                    tgt_sim = ne_tgt @ ne_tgt.T
+                    unique_mask = torch.ones(N_ne, dtype=torch.bool, device=device)
+                    for i in range(1, N_ne):
+                        if (tgt_sim[i, :i] > 0.999).any():
+                            unique_mask[i] = False
+                    ne_pred_u = ne_pred[unique_mask]
+                    ne_tgt_u  = ne_tgt[unique_mask]
+                    N_u = int(unique_mask.sum())
+
+                    if N_u >= 2:
+                        logits   = (ne_pred_u @ ne_tgt_u.T) / args.inv_temperature
+                        type_loss = F.cross_entropy(logits, torch.arange(N_u, device=device))
+                    else:
+                        # Only one unique type after dedup — fall back to cosine
+                        type_loss = 1.0 - (ne_pred_u * ne_tgt_u).sum(dim=-1).mean()
                 elif N_ne == 1:
-                    # Only one non-empty slot — fall back to cosine regression
-                    type_loss = 1.0 - (pred_type[non_empty] * tgt_type[non_empty]).sum()
+                    type_loss = 1.0 - (pred_type[non_empty] * tgt_type[non_empty]).sum(dim=-1).mean()
                 else:
                     type_loss = None
 
@@ -591,8 +688,9 @@ def main():
         if chunk_losses:
             losses.append(sum(chunk_losses))
 
-            avg_loss      = sum(chunk_losses)
-            avg_type_loss = sum(chunk_type_losses)  / len(chunk_type_losses)  if chunk_type_losses  else 0.0
+            avg_loss       = sum(chunk_losses)
+            avg_lm_loss    = sum(chunk_lm_losses)    / len(chunk_lm_losses)    if chunk_lm_losses    else 0.0
+            avg_type_loss  = sum(chunk_type_losses)  / len(chunk_type_losses)  if chunk_type_losses  else 0.0
             avg_count_loss = sum(chunk_count_losses) / len(chunk_count_losses) if chunk_count_losses else 0.0
 
             step_time = time.time() - step_start
@@ -600,6 +698,7 @@ def main():
 
             metrics = {
                 'loss': avg_loss,
+                'lm_loss': avg_lm_loss,
                 'type_loss': avg_type_loss,
                 'count_loss': avg_count_loss,
                 'grad_norm': grad_norm.item() if isinstance(grad_norm, torch.Tensor) else (grad_norm or 0.0),
@@ -610,7 +709,7 @@ def main():
             logger.log(metrics, step)
 
             if rank == 0 and step % args.log_every == 0:
-                print(f"{step:>8} {avg_loss:>10.4f} {avg_type_loss:>10.4f} {avg_count_loss:>10.4f} {step_time:>8.2f}s")
+                print(f"{step:>8} {avg_loss:>10.4f} {avg_lm_loss:>10.4f} {avg_type_loss:>10.4f} {avg_count_loss:>10.4f} {step_time:>8.2f}s")
 
         # Checkpoint
         if (step + 1) % args.eval_every == 0:

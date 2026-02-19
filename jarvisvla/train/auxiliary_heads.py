@@ -65,21 +65,18 @@ class InventoryEmbeddingHead(nn.Module):
 
         intermediate_dim = hidden_dim // 4
 
-        self.projection = nn.Sequential(
+        # Per-slot readout: each of the 36 slots gets its own dedicated projection
+        # direction out of the hidden state.  The old design broadcast a single
+        # 768-dim base vector to all slots and differentiated them with a small
+        # (96-dim) slot-position embedding — so every slot's prediction was nearly
+        # the same linear function of the hidden state.  Here the final Linear maps
+        # to num_slots * output_dim, giving each slot an independent weight row.
+        self.to_slots = nn.Sequential(
             nn.Linear(hidden_dim, intermediate_dim),
             nn.LayerNorm(intermediate_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(intermediate_dim, output_dim),
-        )
-
-        # Learnable slot-position embeddings (hotbar slot 0, inventory row 1, …)
-        self.slot_embedding = nn.Embedding(num_slots, output_dim // 8)
-
-        # Fuse base projection with slot embedding
-        self.fusion = nn.Sequential(
-            nn.Linear(output_dim + output_dim // 8, output_dim),
-            nn.LayerNorm(output_dim),
+            nn.Linear(intermediate_dim, num_slots * output_dim),
         )
 
         # Count head: predicts log(count + 1) per slot from the fused representation
@@ -115,16 +112,10 @@ class InventoryEmbeddingHead(nn.Module):
             count_preds:     [batch, num_slots]               predicted log(count+1)
         """
         batch_size = hidden_states.shape[0]
-        device = hidden_states.device
 
-        base = self.projection(hidden_states)                          # [batch, D]
-        base = base.unsqueeze(1).expand(-1, self.num_slots, -1)        # [batch, S, D]
-
-        slot_idx = torch.arange(self.num_slots, device=device)
-        slot_emb = self.slot_embedding(slot_idx)                       # [S, D//8]
-        slot_emb = slot_emb.unsqueeze(0).expand(batch_size, -1, -1)   # [batch, S, D//8]
-
-        fused = self.fusion(torch.cat([base, slot_emb], dim=-1))       # [batch, S, D]
+        fused = self.to_slots(hidden_states).view(
+            batch_size, self.num_slots, self.output_dim
+        )                                                              # [batch, S, D]
 
         type_embeddings = F.normalize(fused, p=2, dim=-1)             # [batch, S, D]
         count_preds = self.count_head(fused).squeeze(-1)               # [batch, S]
