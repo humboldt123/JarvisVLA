@@ -362,7 +362,7 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--base_model_lr', type=float, default=1e-6)
     parser.add_argument('--bptt_chunk_size', type=int, default=4)
-    parser.add_argument('--memory_dim', type=int, default=512)
+    parser.add_argument('--memory_dim', type=int, default=1024)
     parser.add_argument('--inventory_weight', type=float, default=1.0,
                         help='Scale factor on the InfoNCE type loss')
     parser.add_argument('--count_weight', type=float, default=0.1,

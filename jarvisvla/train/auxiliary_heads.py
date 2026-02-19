@@ -154,7 +154,7 @@ class MemoryProjections(nn.Module):
     
     def __init__(
         self,
-        memory_dim: int = 512,
+        memory_dim: int = 1024,
         hidden_dim: int = 3584,
         use_mlp: bool = False,
         dropout: float = 0.1,
@@ -178,9 +178,28 @@ class MemoryProjections(nn.Module):
             # Simple linear projection (sufficient for now)
             self.W_in = nn.Linear(memory_dim, hidden_dim)
         
-        # W_out: hidden_dim -> memory_dim (compresses updated memory)
+        # W_out: hidden_dim -> memory_dim (candidate new memory content)
         self.W_out = nn.Linear(hidden_dim, memory_dim)
-        
+
+        # GRU-style update gate.
+        #
+        # Without gating, every step does:
+        #   new_memory = W_out(hidden)
+        # which fully overwrites the memory — inventory seen at frame t is gone by t+1.
+        #
+        # With a GRU gate:
+        #   z          = sigmoid(W_gate([hidden ; prev_memory]))   ∈ (0,1)^memory_dim
+        #   candidate  = W_out(hidden)
+        #   new_memory = z * prev_memory  +  (1 - z) * candidate
+        #
+        # When z ≈ 1 → mostly keep prev_memory  (nothing changed, preserve state)
+        # When z ≈ 0 → mostly use candidate     (inventory updated, write new content)
+        #
+        # The model learns z from both the current hidden state AND the previous
+        # memory, so it can detect "I just saw the inventory screen open" and
+        # choose to write, vs "I'm just walking around" and choose to preserve.
+        self.W_gate = nn.Linear(hidden_dim + memory_dim, memory_dim)
+
         self._init_weights()
     
     def _init_weights(self):
@@ -214,25 +233,28 @@ class MemoryProjections(nn.Module):
         """
         return self.W_in(memory)
     
-    def project_out(self, hidden: torch.Tensor) -> torch.Tensor:
+    def project_out(self, hidden: torch.Tensor, prev_memory: torch.Tensor) -> torch.Tensor:
         """
-        Project hidden state back to memory dimension.
-        
+        GRU-style gated memory update.
+
         Args:
-            hidden: [batch, hidden_dim] - hidden state at memory token position
-        
+            hidden:      [batch, hidden_dim]  — hidden state at memory token position
+            prev_memory: [batch, memory_dim]  — memory carried in from the previous step
+
         Returns:
-            memory: [batch, memory_dim] - compressed for next timestep
+            new_memory: [batch, memory_dim]
         """
-        return self.W_out(hidden)
+        candidate = self.W_out(hidden)
+        gate = torch.sigmoid(self.W_gate(torch.cat([hidden, prev_memory], dim=-1)))
+        return gate * prev_memory + (1 - gate) * candidate
 
 
 class HiddenStateExtractor(nn.Module):
     """
     Extracts the hidden state at a specific position (e.g., memory token).
     
-    For the memory token, we want the hidden state at the last position
-    (since memory is appended after visual/text tokens).
+    For the memory token, we want the hidden state at the first position
+    (since memory is prepended before visual/text tokens).
     """
     
     def __init__(self, extract_position: str = "last"):
