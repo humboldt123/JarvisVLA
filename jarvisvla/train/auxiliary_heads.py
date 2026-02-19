@@ -20,46 +20,51 @@ from typing import Optional, Dict, Tuple, List
 
 class InventoryEmbeddingHead(nn.Module):
     """
-    Auxiliary head that predicts inventory embeddings from hidden state.
-    
-    This head forces the model to maintain inventory information in its
-    hidden state across arbitrary time spans. The hidden state becomes
-    a memory that persists inventory contents even when the inventory
-    screen is not visible.
-    
-    Architecture:
-        [Hidden State] → [MLP] → [768-dim Embedding per slot]
-        
-    Loss: Cosine similarity between predicted embedding and target
-          (target is encoded by frozen text encoder like BERT)
-    
-    At inference: This head is DROPPED. The model uses its internal
-    memory (hidden state) to answer inventory queries.
-    
+    Auxiliary head that predicts per-slot inventory state from the memory hidden state.
+
+    Outputs two tensors per forward pass:
+        type_embeddings  [batch, num_slots, output_dim]  — L2-normalised BERT-space
+                         embedding for each slot's item type.  Trained with InfoNCE
+                         (contrastive) loss so the model must distinguish items, not
+                         just land in the general "item description" cluster.
+        count_preds      [batch, num_slots]              — predicted log(count+1) for
+                         each slot.  Trained with MSE against log(true_count+1).
+
+    # --- Future NBT head (not yet implemented) ---
+    # A third output nbt_embeddings [batch, num_slots, output_dim] would encode
+    # arbitrary NBT metadata (enchantments, durability, custom names, etc.) as a
+    # BERT embedding of the flattened NBT string.  Same InfoNCE loss as the type
+    # head.  Slots with no NBT all map to BERT("no_nbt").
+    # Add: self.nbt_head = copy of fusion + Linear(output_dim, output_dim) + LayerNorm
+
+    Loss computation is done externally in the training loop so that InfoNCE can
+    aggregate non-empty slots across the full BPTT chunk for more negatives.
+
     Args:
-        hidden_dim: Dimension of model's hidden state (e.g., 3584 for Qwen2VL-7B)
-        output_dim: Dimension of inventory embedding (default: 768 for BERT)
-        num_slots: Number of inventory slots (default: 36)
-        dropout: Dropout rate
+        hidden_dim:  Dimension of the model's hidden state (3584 for Qwen2VL-7B)
+        output_dim:  Dimension of BERT embeddings (768)
+        num_slots:   Number of inventory slots (36 for Minecraft)
+        dropout:     Dropout rate
+        temperature: InfoNCE temperature (default 0.07, same as CLIP)
     """
-    
+
     def __init__(
         self,
         hidden_dim: int,
         output_dim: int = 768,
         num_slots: int = 36,
         dropout: float = 0.1,
+        temperature: float = 0.07,
     ):
         super().__init__()
-        
+
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.num_slots = num_slots
-        
-        # MLP to project hidden state to inventory embedding
-        # Using a bottleneck architecture for efficiency
+        self.temperature = temperature
+
         intermediate_dim = hidden_dim // 4
-        
+
         self.projection = nn.Sequential(
             nn.Linear(hidden_dim, intermediate_dim),
             nn.LayerNorm(intermediate_dim),
@@ -67,21 +72,28 @@ class InventoryEmbeddingHead(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(intermediate_dim, output_dim),
         )
-        
-        # Per-slot embeddings (slot 0 = hotbar slot 0, etc.)
-        # This helps distinguish which slot we're predicting
+
+        # Learnable slot-position embeddings (hotbar slot 0, inventory row 1, …)
         self.slot_embedding = nn.Embedding(num_slots, output_dim // 8)
-        
-        # Final fusion layer
+
+        # Fuse base projection with slot embedding
         self.fusion = nn.Sequential(
             nn.Linear(output_dim + output_dim // 8, output_dim),
             nn.LayerNorm(output_dim),
         )
-        
+
+        # Count head: predicts log(count + 1) per slot from the fused representation
+        # Softplus ensures output is always positive (target log(count+1) >= 0)
+        self.count_head = nn.Sequential(
+            nn.Linear(output_dim, output_dim // 4),
+            nn.GELU(),
+            nn.Linear(output_dim // 4, 1),
+            nn.Softplus(),
+        )
+
         self._init_weights()
-    
+
     def _init_weights(self):
-        """Initialize with small weights for stability."""
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight, gain=0.1)
@@ -89,145 +101,35 @@ class InventoryEmbeddingHead(nn.Module):
                     nn.init.constant_(module.bias, 0)
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, std=0.02)
-    
+
     def forward(
         self,
         hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass to predict inventory embeddings.
-        
         Args:
-            hidden_states: [batch, hidden_dim] - the model's hidden state
-                          (raw_updated_memory from the memory token position)
-        
+            hidden_states: [batch, hidden_dim]
+
         Returns:
-            embeddings: [batch, num_slots, output_dim]
-                       Predicted embeddings for each inventory slot
+            type_embeddings: [batch, num_slots, output_dim]  L2-normalised
+            count_preds:     [batch, num_slots]               predicted log(count+1)
         """
         batch_size = hidden_states.shape[0]
         device = hidden_states.device
-        
-        # Project base hidden state
-        base_embedding = self.projection(hidden_states)  # [batch, output_dim]
-        
-        # Expand for all slots
-        base_embedding = base_embedding.unsqueeze(1).expand(-1, self.num_slots, -1)
-        # [batch, num_slots, output_dim]
-        
-        # Add slot embeddings
-        slot_indices = torch.arange(self.num_slots, device=device)
-        slot_emb = self.slot_embedding(slot_indices)  # [num_slots, output_dim//8]
-        slot_emb = slot_emb.unsqueeze(0).expand(batch_size, -1, -1)
-        # [batch, num_slots, output_dim//8]
-        
-        # Concatenate and fuse
-        combined = torch.cat([base_embedding, slot_emb], dim=-1)
-        embeddings = self.fusion(combined)  # [batch, num_slots, output_dim]
-        
-        # L2 normalize for cosine similarity
-        embeddings = F.normalize(embeddings, p=2, dim=-1)
-        
-        return embeddings
-    
-    def compute_loss(
-        self,
-        predicted_embeddings: torch.Tensor,
-        target_embeddings: torch.Tensor,
-        valid_mask: Optional[torch.Tensor] = None,
-        is_non_empty: Optional[torch.Tensor] = None,
-        non_empty_weight: float = 5.0,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Compute cosine similarity loss with weighting for non-empty frames.
-        
-        The OpenVPT dataset is heavily imbalanced (most frames have empty inventory).
-        Without weighting, the model could ignore rare non-empty events and simply
-        learn to always predict "empty". We weight non-empty frames more heavily
-        to ensure the model learns to predict inventory contents.
-        
-        Args:
-            predicted_embeddings: [batch, num_slots, output_dim]
-            target_embeddings: [batch, num_slots, output_dim] 
-                              (from frozen text encoder)
-            valid_mask: [batch, num_slots] - which slots to compute loss on
-            is_non_empty: [batch] - boolean tensor indicating non-empty frames
-            non_empty_weight: Weight multiplier for non-empty frames (default: 5.0)
-        
-        Returns:
-            loss: Scalar loss
-            metrics: Dictionary of metrics for logging
-        """
-        # Normalize targets (in case they aren't already)
-        target_embeddings = F.normalize(target_embeddings, p=2, dim=-1)
-        
-        # Cosine similarity for each slot
-        similarity = (predicted_embeddings * target_embeddings).sum(dim=-1)
-        # [batch, num_slots], range [-1, 1]
-        
-        # Loss: 1 - cosine_similarity (so lower is better)
-        per_slot_loss = 1.0 - similarity
-        
-        # Apply mask if provided
-        if valid_mask is not None:
-            per_slot_loss = per_slot_loss * valid_mask
-            frame_loss = per_slot_loss.sum(dim=-1) / (valid_mask.sum(dim=-1) + 1e-8)
-        else:
-            frame_loss = per_slot_loss.mean(dim=-1)
-        # frame_loss: [batch]
-        
-        # Weight non-empty frames more heavily because the dataset is heavily imbalanced
-        # (most frames have empty inventory). Without weighting, the model could ignore
-        # rare non-empty events and simply learn to always predict "empty".
-        if is_non_empty is not None:
-            # is_non_empty: [batch] boolean -> float weights
-            frame_weights = torch.where(
-                is_non_empty,
-                torch.tensor(non_empty_weight, dtype=frame_loss.dtype, device=frame_loss.device),
-                torch.tensor(1.0, dtype=frame_loss.dtype, device=frame_loss.device)
-            )
-            weighted_loss = (frame_loss * frame_weights).sum() / (frame_weights.sum() + 1e-8)
-            
-            # Track metrics for empty vs non-empty separately
-            with torch.no_grad():
-                empty_mask = ~is_non_empty
-                empty_loss = frame_loss[empty_mask].mean() if empty_mask.any() else torch.tensor(0.0)
-                non_empty_loss = frame_loss[is_non_empty].mean() if is_non_empty.any() else torch.tensor(0.0)
-        else:
-            weighted_loss = frame_loss.mean()
-            empty_loss = frame_loss.mean()
-            non_empty_loss = torch.tensor(0.0)
-        
-        loss = weighted_loss
-        
-        # Compute metrics
-        with torch.no_grad():
-            avg_similarity = similarity.mean().item()
-            accurate_slots = (similarity > 0.9).float()
-            if valid_mask is not None:
-                accuracy = (accurate_slots * valid_mask).sum() / (valid_mask.sum() + 1e-8)
-            else:
-                accuracy = accurate_slots.mean()
-            
-            # Separate accuracies for empty vs non-empty
-            if is_non_empty is not None:
-                empty_sim = similarity[~is_non_empty].mean().item() if (~is_non_empty).any() else 0.0
-                non_empty_sim = similarity[is_non_empty].mean().item() if is_non_empty.any() else 0.0
-            else:
-                empty_sim = avg_similarity
-                non_empty_sim = 0.0
-        
-        metrics = {
-            'inventory_embedding_loss': loss.item(),
-            'inventory_cosine_similarity': avg_similarity,
-            'inventory_embedding_accuracy': accuracy.item(),
-            'inventory_empty_loss': empty_loss.item() if isinstance(empty_loss, torch.Tensor) else empty_loss,
-            'inventory_nonempty_loss': non_empty_loss.item() if isinstance(non_empty_loss, torch.Tensor) else non_empty_loss,
-            'inventory_empty_cosine_sim': empty_sim,
-            'inventory_nonempty_cosine_sim': non_empty_sim,
-        }
-        
-        return loss, metrics
+
+        base = self.projection(hidden_states)                          # [batch, D]
+        base = base.unsqueeze(1).expand(-1, self.num_slots, -1)        # [batch, S, D]
+
+        slot_idx = torch.arange(self.num_slots, device=device)
+        slot_emb = self.slot_embedding(slot_idx)                       # [S, D//8]
+        slot_emb = slot_emb.unsqueeze(0).expand(batch_size, -1, -1)   # [batch, S, D//8]
+
+        fused = self.fusion(torch.cat([base, slot_emb], dim=-1))       # [batch, S, D]
+
+        type_embeddings = F.normalize(fused, p=2, dim=-1)             # [batch, S, D]
+        count_preds = self.count_head(fused).squeeze(-1)               # [batch, S]
+
+        return type_embeddings, count_preds
 
 
 class MemoryProjections(nn.Module):

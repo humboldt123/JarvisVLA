@@ -15,6 +15,7 @@ import os
 import sys
 import argparse
 import json
+import math
 import time
 from datetime import datetime
 from pathlib import Path
@@ -170,9 +171,10 @@ def evaluate_on_test_set(model, test_loader, processor, args, device, rank, logg
 
     total_cos = 0.0
     non_empty_cos = 0.0
+    total_count_mae = 0.0
     n_total = 0
     n_non_empty = 0
-    # rank 0 collects vocab + display examples for NN-decoded output
+    n_count = 0
     vocab_set: set = set()
     display_examples: List[Dict] = []
 
@@ -185,10 +187,13 @@ def evaluate_on_test_set(model, test_loader, processor, args, device, rank, logg
             memory = torch.zeros(1, args.memory_dim, device=device, dtype=torch.bfloat16)
 
             for t in range(len(seq['frames'])):
-                frame = seq['frames'][t]
-                inv_target = seq['inventory_embeddings'][t:t+1].to(device)
-                is_non_empty = seq['inventory_has_items'][t]
-                slot_texts   = seq.get('inventory_slot_texts', [[]] * len(seq['frames']))[t]
+                frame            = seq['frames'][t]
+                inv_type_target  = seq['inventory_embeddings'][t:t+1].to(device, dtype=torch.bfloat16)  # [1,36,768]
+                inv_count_target = seq['inventory_counts'][t:t+1].to(device)      # [1,36] long
+                is_non_empty     = seq['inventory_has_items'][t]
+                slot_type_texts  = seq.get('inventory_slot_texts',
+                                           [['empty slot']*36]*len(seq['frames']))[t]
+                slot_counts      = seq['inventory_counts'][t]  # [36] long, cpu
 
                 chat_text = processor.apply_chat_template(
                     [{"role": "user", "content": [
@@ -208,51 +213,63 @@ def evaluate_on_test_set(model, test_loader, processor, args, device, rank, logg
                     prev_memory=memory,
                     attention_mask=inputs.get('attention_mask'),
                     labels=None,
-                    inventory_embeddings=inv_target,
                 )
 
                 if outputs.inventory_embedding is not None:
-                    pred   = outputs.inventory_embedding[0]  # [36, 768] — inventory head
-                    target = inv_target[0]                   # [36, 768]
-                    per_slot_cos = (pred * target).sum(dim=-1)  # [36]
+                    pred_type  = outputs.inventory_embedding[0]  # [36, 768]
+                    pred_count = outputs.inventory_count[0]       # [36] log(count+1) preds
+                    tgt_type   = inv_type_target[0]               # [36, 768]
+                    tgt_count  = inv_count_target[0].float()      # [36]
+
+                    per_slot_cos = (pred_type * tgt_type).sum(dim=-1)
                     cos_sim = per_slot_cos.mean().item()
                     total_cos += cos_sim
                     n_total += 1
+
                     if is_non_empty:
                         non_empty_cos += cos_sim
                         n_non_empty += 1
+                        non_empty_mask = tgt_count > 0
+                        if non_empty_mask.any():
+                            pred_cnt_exp = (torch.exp(pred_count[non_empty_mask]) - 1).clamp(min=0)
+                            mae = (pred_cnt_exp - tgt_count[non_empty_mask]).abs().mean().item()
+                            total_count_mae += mae
+                            n_count += 1
 
                     if rank == 0:
-                        # Accumulate vocab for NN decoding (all non-empty slot texts seen)
-                        for txt in slot_texts:
+                        for txt in slot_type_texts:
                             if txt != "empty slot":
                                 vocab_set.add(txt)
 
-                        # Collect up to 3 non-empty frames for display
                         if is_non_empty and len(display_examples) < 3:
                             display_examples.append({
                                 'source': seq.get('source_file', '?'),
                                 'tick': t,
                                 'mean_cos': cos_sim,
-                                # (slot_idx, gt_text, pred_emb_cpu, cos_sim_for_slot)
+                                # (slot_idx, type_text, true_count, pred_type_emb,
+                                #  pred_log_count, per_slot_cos)
                                 'slots': [
-                                    (i, slot_texts[i],
-                                     pred[i].float().cpu(),
+                                    (i, slot_type_texts[i],
+                                     int(slot_counts[i].item()),
+                                     pred_type[i].float().cpu(),
+                                     pred_count[i].float().item(),
                                      per_slot_cos[i].item())
-                                    for i in range(len(slot_texts))
-                                    if slot_texts[i] != "empty slot"
+                                    for i in range(len(slot_type_texts))
+                                    if slot_type_texts[i] != "empty slot"
                                 ],
                             })
 
                 memory = outputs.new_memory.detach()
 
-    avg_cos          = total_cos    / max(n_total,     1)
-    avg_ne_cos       = non_empty_cos / max(n_non_empty, 1)
-    non_empty_pct    = 100.0 * n_non_empty / max(n_total, 1)
+    avg_cos       = total_cos       / max(n_total,     1)
+    avg_ne_cos    = non_empty_cos   / max(n_non_empty, 1)
+    avg_count_mae = total_count_mae / max(n_count,     1)
+    non_empty_pct = 100.0 * n_non_empty / max(n_total, 1)
 
     eval_metrics = {
         'eval_cos_sim':           avg_cos,
         'eval_non_empty_cos_sim': avg_ne_cos,
+        'eval_count_mae':         avg_count_mae,
         'eval_non_empty_pct':     non_empty_pct,
         'eval_n_frames':          n_total,
         'eval_seqs':              num_seqs,
@@ -263,43 +280,44 @@ def evaluate_on_test_set(model, test_loader, processor, args, device, rank, logg
         print(f"\n{'='*70}")
         print(f"TEST SET EVALUATION  ({num_seqs} seqs, {n_total} frames)")
         print(f"{'='*70}")
-        print(f"  All frames    avg cosine sim : {avg_cos:.4f}")
-        print(f"  Non-empty     avg cosine sim : {avg_ne_cos:.4f}"
-              f"  ({n_non_empty}/{n_total} frames = {non_empty_pct:.1f}%)")
+        print(f"  Type cos-sim (all frames)  : {avg_cos:.4f}")
+        print(f"  Type cos-sim (non-empty)   : {avg_ne_cos:.4f}"
+              f"  ({n_non_empty}/{n_total} = {non_empty_pct:.1f}%)")
+        print(f"  Count MAE  (non-empty slots): {avg_count_mae:.2f} items")
 
         if display_examples and vocab_set:
-            # BERT-encode the vocabulary once for nearest-neighbour decoding
             enc = test_loader.encoder
             vocab_list = sorted(vocab_set)
             vocab_inputs = enc.tokenizer(
                 vocab_list, return_tensors="pt",
-                padding=True, truncation=True, max_length=64,
+                padding=True, truncation=True, max_length=32,
             ).to(enc.device)
             with torch.no_grad():
                 vocab_embs = enc.model(**vocab_inputs).last_hidden_state[:, 0, :]
-                vocab_embs = F.normalize(vocab_embs, p=2, dim=-1)  # [V, 768]
+                vocab_embs = F.normalize(vocab_embs, p=2, dim=-1)
             vocab_embs_cpu = vocab_embs.cpu()
 
-            print(f"\n--- Inventory head: ground truth → NN-decoded prediction ---")
-            print(f"    (predictions decoded by nearest-neighbour in BERT space)")
+            print(f"\n--- Inventory head predictions (NN-decoded, non-empty frames) ---")
             for ex in display_examples:
-                gt_items  = {txt for _, txt, _, _ in ex['slots']}
+                gt_items   = {txt for _, txt, _, _, _, _ in ex['slots']}
                 pred_items: set = set()
 
-                print(f"\n  [{ex['source']}  tick {ex['tick']}]  mean cos_sim={ex['mean_cos']:.3f}")
-                for slot_idx, gt_text, pred_emb, cs in ex['slots']:
-                    sims     = (pred_emb.unsqueeze(0) @ vocab_embs_cpu.T).squeeze(0)
-                    pred_text = vocab_list[sims.argmax().item()]
-                    pred_items.add(pred_text)
-                    match = '✓' if pred_text == gt_text else '✗'
-                    bar   = '█' * int(cs * 20) + '░' * (20 - int(cs * 20))
-                    print(f"    slot {slot_idx:>2}  GT: {gt_text:<28}  "
-                          f"PRED: {pred_text:<28}  {bar} {cs:.3f} {match}")
+                print(f"\n  [{ex['source']}  tick {ex['tick']}]  type cos={ex['mean_cos']:.3f}")
+                for slot_idx, type_text, true_cnt, pred_emb, pred_log_cnt, cs in ex['slots']:
+                    pred_cnt = max(0, round(math.exp(pred_log_cnt) - 1))
+                    sims = (pred_emb.unsqueeze(0) @ vocab_embs_cpu.T).squeeze(0)
+                    pred_type = vocab_list[sims.argmax().item()]
+                    pred_items.add(pred_type)
+                    match = '✓' if pred_type == type_text else '✗'
+                    bar = '█' * int(cs * 20) + '░' * (20 - int(cs * 20))
+                    print(f"    slot {slot_idx:>2}"
+                          f"  GT: {type_text:<20} cnt:{true_cnt:<4}"
+                          f"PRED: {pred_type:<20} cnt:{pred_cnt:<4}"
+                          f"  {bar} {cs:.3f} {match}")
 
-                # Jaccard over the item-name sets for this frame
                 if gt_items or pred_items:
                     jaccard = len(gt_items & pred_items) / len(gt_items | pred_items)
-                    print(f"           Jaccard (item sets): {jaccard:.2f}"
+                    print(f"           Jaccard (types): {jaccard:.2f}"
                           f"  GT={sorted(gt_items)}  PRED={sorted(pred_items)}")
 
         print(f"{'='*70}")
@@ -345,8 +363,12 @@ def main():
     parser.add_argument('--base_model_lr', type=float, default=1e-6)
     parser.add_argument('--bptt_chunk_size', type=int, default=4)
     parser.add_argument('--memory_dim', type=int, default=512)
-    parser.add_argument('--inventory_weight', type=float, default=0.1)
-    parser.add_argument('--non_empty_weight', type=float, default=5.0)
+    parser.add_argument('--inventory_weight', type=float, default=1.0,
+                        help='Scale factor on the InfoNCE type loss')
+    parser.add_argument('--count_weight', type=float, default=0.1,
+                        help='Scale factor on the count MSE loss')
+    parser.add_argument('--inv_temperature', type=float, default=0.07,
+                        help='InfoNCE temperature (lower = sharper, like CLIP default)')
     parser.add_argument('--grad_accum_steps', type=int, default=4)
     parser.add_argument('--resume_from', type=str, default=None)
     parser.add_argument('--log_every', type=int, default=10, help='Log metrics every N steps')
@@ -441,12 +463,7 @@ def main():
     from jarvisvla.train.sequence_dataset import InventoryTextEncoder, OnDemandSequenceLoader
     
     encoder = InventoryTextEncoder(device=device)
-    
-    with torch.no_grad():
-        empty_inputs = encoder.tokenizer("empty inventory", return_tensors="pt", padding=True).to(device)
-        empty_emb = encoder.model(**empty_inputs).last_hidden_state[0, 0, :]
-        empty_emb = F.normalize(empty_emb, dim=-1)
-    
+
     jsonl_files = sorted(Path(args.data_dir).glob("*.jsonl"))
     train_files = jsonl_files[:args.train_jsonls]
     test_files  = jsonl_files[args.train_jsonls:args.train_jsonls + args.test_jsonls]
@@ -462,8 +479,8 @@ def main():
         print(f"\n[4/5] Training from step {start_step} to {args.train_steps}...")
         print(f"  Logging every {args.log_every} steps")
         print(f"  Checkpointing every {args.eval_every} steps")
-        print(f"\n{'Step':>8} {'Loss':>10} {'InvLoss':>10} {'CosSim':>8} {'EmptyAcc':>8} {'Time':>8}")
-        print("-"*70)
+        print(f"\n{'Step':>8} {'Loss':>10} {'TypeLoss':>10} {'CntLoss':>10} {'Time':>8}")
+        print("-"*55)
     
     step_times = []
     
@@ -473,23 +490,21 @@ def main():
         model.train()
         model.train_aux_heads(True)  # Enable inventory head
         chunk_losses = []
-        chunk_inv_losses = []
-        chunk_metrics = []
+        chunk_type_losses = []
+        chunk_count_losses = []
 
-        # Initialize memory for this BPTT chunk
         memory = torch.zeros(1, args.memory_dim, device=device, dtype=torch.bfloat16)
-        
-        # Get random sequence
+
         seq_idx = torch.randint(0, len(train_loader), (1,)).item()
         seq = train_loader[seq_idx]
         start_idx = torch.randint(0, max(1, len(seq['frames']) - args.bptt_chunk_size), (1,)).item()
-        
+
+        scale = args.bptt_chunk_size * args.grad_accum_steps
+
         for t in range(start_idx, min(start_idx + args.bptt_chunk_size, len(seq['frames']))):
             frame = seq['frames'][t]
-            inv_target = seq['inventory_embeddings'][t:t+1].to(device)
-            
-            # Check whether this frame has a non-empty inventory (for loss weighting)
-            is_non_empty = seq['inventory_has_items'][t]
+            inv_type_target  = seq['inventory_embeddings'][t:t+1].to(device, dtype=torch.bfloat16)  # [1, 36, 768]
+            inv_count_target = seq['inventory_counts'][t:t+1].to(device)      # [1, 36] long
 
             chat_text = processor.apply_chat_template(
                 [{"role": "user", "content": [
@@ -501,8 +516,6 @@ def main():
             inputs = processor(text=chat_text, images=[frame], return_tensors="pt")
             inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
-            # LM supervision disabled (labels=None): the VPT dataset has no paired
-            # text answers, so we train exclusively on the inventory embedding head.
             outputs = model(
                 input_ids=inputs.get('input_ids'),
                 pixel_values=inputs.get('pixel_values'),
@@ -510,29 +523,53 @@ def main():
                 prev_memory=memory,
                 attention_mask=inputs.get('attention_mask'),
                 labels=None,
-                inventory_loss_weight=args.inventory_weight,
-                inventory_embeddings=inv_target,
             )
 
-            if outputs.inventory_loss is not None:
-                # Reconstruct loss from components so non_empty_weight scales only
-                # the inventory term, not the memory regularization.
-                memory_reg = 0.01 * (outputs.new_memory ** 2).mean()
-                inv_ne_weight = args.non_empty_weight if is_non_empty else 1.0
-                scale = args.bptt_chunk_size * args.grad_accum_steps
-                step_loss = (memory_reg + args.inventory_weight * inv_ne_weight * outputs.inventory_loss) / scale
-                step_loss.backward()
+            memory_reg = 0.01 * (outputs.new_memory ** 2).mean()
+            step_loss = memory_reg / scale  # base: always backprop memory reg
 
-                chunk_losses.append(step_loss.item() * scale)  # store unscaled for logging
-                chunk_inv_losses.append(outputs.inventory_loss.item())
+            if outputs.inventory_embedding is not None:
+                pred_type  = outputs.inventory_embedding[0]   # [36, 768]
+                pred_count = outputs.inventory_count[0]        # [36]
+                tgt_type   = inv_type_target[0]                # [36, 768]
+                tgt_count  = inv_count_target[0].float()       # [36]
 
-                if outputs.inventory_embedding is not None:
-                    inv_metrics = compute_inventory_metrics(
-                        outputs.inventory_embedding[0].mean(dim=0),
-                        inv_target[0].mean(dim=0),
-                        empty_emb
+                non_empty = tgt_count > 0                      # [36] bool mask
+                N_ne = int(non_empty.sum().item())
+
+                # --- Type loss: InfoNCE over non-empty slots in this frame ---
+                # N_ne non-empty slots form (pred, target) pairs; all other pairs
+                # in the [N_ne × N_ne] similarity matrix are negatives.
+                if N_ne >= 2:
+                    ne_pred = pred_type[non_empty]             # [N_ne, 768]
+                    ne_tgt  = tgt_type[non_empty]              # [N_ne, 768]
+                    logits  = (ne_pred @ ne_tgt.T) / args.inv_temperature
+                    labels_t = torch.arange(N_ne, device=device)
+                    type_loss = F.cross_entropy(logits, labels_t)
+                elif N_ne == 1:
+                    # Only one non-empty slot — fall back to cosine regression
+                    type_loss = 1.0 - (pred_type[non_empty] * tgt_type[non_empty]).sum()
+                else:
+                    type_loss = None
+
+                # --- Count loss: MSE on log(count+1) for non-empty slots ---
+                if N_ne > 0:
+                    count_loss = F.mse_loss(
+                        pred_count[non_empty],
+                        torch.log(tgt_count[non_empty] + 1).to(pred_count.dtype),
                     )
-                    chunk_metrics.append(inv_metrics)
+                else:
+                    count_loss = None
+
+                if type_loss is not None:
+                    step_loss = step_loss + args.inventory_weight * type_loss / scale
+                    chunk_type_losses.append(type_loss.item())
+                if count_loss is not None:
+                    step_loss = step_loss + args.count_weight * count_loss / scale
+                    chunk_count_losses.append(count_loss.item())
+
+            step_loss.backward()
+            chunk_losses.append(step_loss.item() * scale)
 
             memory = outputs.new_memory.detach()
         
@@ -554,21 +591,17 @@ def main():
         if chunk_losses:
             losses.append(sum(chunk_losses))
 
-            avg_loss = sum(chunk_losses)
-            avg_inv_loss = sum(chunk_inv_losses) / len(chunk_inv_losses) if chunk_inv_losses else 0.0
-            avg_cos_sim = sum(m['cosine_similarity'] for m in chunk_metrics) / len(chunk_metrics) if chunk_metrics else 0.0
-            avg_empty_acc = sum(m['empty_accuracy'] for m in chunk_metrics) / len(chunk_metrics) if chunk_metrics else 0.0
-            pct_empty = sum(m['target_empty'] for m in chunk_metrics) / len(chunk_metrics) if chunk_metrics else 0.0
+            avg_loss      = sum(chunk_losses)
+            avg_type_loss = sum(chunk_type_losses)  / len(chunk_type_losses)  if chunk_type_losses  else 0.0
+            avg_count_loss = sum(chunk_count_losses) / len(chunk_count_losses) if chunk_count_losses else 0.0
 
             step_time = time.time() - step_start
             step_times.append(step_time)
 
             metrics = {
                 'loss': avg_loss,
-                'inventory_loss': avg_inv_loss,
-                'cosine_similarity': avg_cos_sim,
-                'empty_accuracy': avg_empty_acc,
-                'pct_empty_frames': pct_empty,
+                'type_loss': avg_type_loss,
+                'count_loss': avg_count_loss,
                 'grad_norm': grad_norm.item() if isinstance(grad_norm, torch.Tensor) else (grad_norm or 0.0),
                 'step_time': step_time,
                 'is_update_step': is_update_step,
@@ -577,8 +610,7 @@ def main():
             logger.log(metrics, step)
 
             if rank == 0 and step % args.log_every == 0:
-                print(f"{step:>8} {avg_loss:>10.4f} {avg_inv_loss:>10.4f} {avg_cos_sim:>8.4f} "
-                      f"{avg_empty_acc:>8.2%} {step_time:>8.2f}s")
+                print(f"{step:>8} {avg_loss:>10.4f} {avg_type_loss:>10.4f} {avg_count_loss:>10.4f} {step_time:>8.2f}s")
 
         # Checkpoint
         if (step + 1) % args.eval_every == 0:
@@ -609,8 +641,9 @@ def main():
         print(f"\nMetrics saved to: {metrics_file}")
         print(f"Plot with: python jarvisvla/train/plot_metrics.py {metrics_file}")
         if eval_metrics:
-            print(f"  Eval cosine sim (all):       {eval_metrics['eval_cos_sim']:.4f}")
-            print(f"  Eval cosine sim (non-empty): {eval_metrics['eval_non_empty_cos_sim']:.4f}")
+            print(f"  Eval type cos-sim (all):     {eval_metrics['eval_cos_sim']:.4f}")
+            print(f"  Eval type cos-sim (non-empty): {eval_metrics['eval_non_empty_cos_sim']:.4f}")
+            print(f"  Eval count MAE:              {eval_metrics['eval_count_mae']:.2f}")
     
     cleanup_distributed()
 
