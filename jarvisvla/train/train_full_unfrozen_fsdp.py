@@ -337,14 +337,10 @@ def evaluate_on_test_set(model, test_loader, processor, args, device, rank, logg
         if display_examples and vocab_set:
             enc = test_loader.encoder
             vocab_list = sorted(vocab_set)
-            vocab_inputs = enc.tokenizer(
-                vocab_list, return_tensors="pt",
-                padding=True, truncation=True, max_length=32,
-            ).to(enc.device)
-            with torch.no_grad():
-                vocab_embs = enc.model(**vocab_inputs).last_hidden_state[:, 0, :]
-                vocab_embs = F.normalize(vocab_embs, p=2, dim=-1)
-            vocab_embs_cpu = vocab_embs.cpu()
+            # Trigram encoder: embed each item name directly (no tokenizer/model attrs)
+            vocab_embs_cpu = torch.stack([
+                torch.from_numpy(enc._name_to_embedding(name)) for name in vocab_list
+            ])  # [vocab_size, 768], already L2-normalised
 
             print(f"\n--- Inventory head predictions (NN-decoded, non-empty frames) ---")
             for ex in display_examples:
