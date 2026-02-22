@@ -625,7 +625,7 @@ class OnDemandSequenceLoader:
         jsonl_files: List[Path],
         sequence_length: int,
         encoder: InventoryTextEncoder,
-        cache_size: int = 10,
+        cache_size: int = 500,
     ):
         self.jsonl_files = jsonl_files
         self.sequence_length = sequence_length
@@ -695,13 +695,18 @@ class OnDemandSequenceLoader:
         cap = cv2.VideoCapture(str(mp4_file))
         frames = []
         if cap.isOpened():
-            for i in range(start_tick, start_tick + self.sequence_length):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+            # Seek once to start_tick, then read sequentially.
+            # Individual cap.set(POS_FRAMES, i) calls inside a loop force a
+            # keyframe-decode for every frame, making loading 10-50x slower.
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_tick)
+            for _ in range(self.sequence_length):
                 ret, frame = cap.read()
                 if ret:
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     frame = cv2.resize(frame, (224, 224))
                     frames.append(Image.fromarray(frame))
+                else:
+                    break
         cap.release()
         # Pad with black frames if video was truncated or had a bad moov atom
         while len(frames) < self.sequence_length:
@@ -717,6 +722,9 @@ class OnDemandSequenceLoader:
         ])
         # Cheap non-empty flag
         has_items = [InventoryTextEncoder.inventory_has_items(t['inventory']) for t in ticks]
+        # True when the inventory screen is actually visible in the frame.
+        # This is when Qwen can get a direct visual update on item contents.
+        is_gui_inventory = [bool(t.get('isGuiInventory', False)) for t in ticks]
 
         # Per-slot type names for NN decoding in eval: List[List[str]] (seq_len, 36)
         # "oak_log" or "empty slot" — counts are in inv_counts, not here
@@ -733,9 +741,10 @@ class OnDemandSequenceLoader:
 
         return {
             'frames': frames,
-            'inventory_embeddings': inv_embs,     # [seq_len, 36, 768] type BERT embs
-            'inventory_counts': inv_counts,        # [seq_len, 36] int counts
-            'inventory_has_items': has_items,
+            'inventory_embeddings': inv_embs,       # [seq_len, 36, 768] type BERT embs
+            'inventory_counts': inv_counts,          # [seq_len, 36] int counts
+            'inventory_has_items': has_items,        # List[bool] — player has any items
+            'is_gui_inventory': is_gui_inventory,    # List[bool] — inventory screen visible
             'inventory_slot_texts': slot_texts_per_tick,  # type names for NN vocab
             'ticks': ticks,
             'source_file': jsonl_file.name,

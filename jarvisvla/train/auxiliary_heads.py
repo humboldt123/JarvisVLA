@@ -91,13 +91,27 @@ class InventoryEmbeddingHead(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        # gain=0.1 was the bug: it makes to_slots output tiny values (std≈0.02),
+        # so the count_head weight gradients are ≈ 0 and only the bias trains —
+        # at 1e-4/step it would take ~23k steps just to reach the mean target.
+        # gain=1.0 gives fused std≈0.2, L2 norm≈5 per slot, letting both heads
+        # receive meaningful gradients from step 1.
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=0.1)
+                nn.init.xavier_uniform_(module.weight, gain=1.0)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, std=0.02)
+
+        # Warm-start the count head's final linear bias so initial predictions
+        # are near log(mean_count+1) ≈ log(9) ≈ 2.2 rather than log(2)≈0.693.
+        # This cuts the initial count_loss by ~70% and makes the gradient
+        # signal informative from the first step instead of just "predict higher".
+        # Softplus(2.2) ≈ 2.3, which corresponds to predicting ~count 9 for every
+        # non-empty slot — a much better prior than predicting count 1.
+        count_final_linear = self.count_head[-2]  # Linear(output_dim//4, 1)
+        nn.init.constant_(count_final_linear.bias, 2.2)
 
     def forward(
         self,

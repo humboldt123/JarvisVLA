@@ -7,10 +7,11 @@ and evaluates it on held-out test sequences, printing per-slot NN-decoded predic
 
 Usage:
     python jarvisvla/train/eval_checkpoint.py \
-        --checkpoint /data/vvm33/checkpoints/full_unfrozen_fsdp/checkpoint_step_1001.pt \
+        --checkpoint /data/vvm33/checkpoints/train_inv_head/checkpoint_step_5000.pt \
         --data_dir   /data/vvm33/vpt_contractor \
-        --train_jsonls 4400 \
-        --test_jsonls  10
+        --train_jsonls 4000 \
+        --test_jsonls  5 \
+        --sequence_length 200
 
 Runs on a single GPU (no torchrun needed) — bfloat16 keeps the 7B model at ~14 GB VRAM.
 """
@@ -32,21 +33,36 @@ from jarvisvla.train.sequence_dataset import InventoryTextEncoder, OnDemandSeque
 
 def evaluate(model, test_loader, processor, args, device):
     num_seqs = len(test_loader)
-    print(f"\nEvaluating on {num_seqs} test sequences ({num_seqs * 50} frames)...")
+    seq_len  = test_loader.sequence_length
+    print(f"\nEvaluating on {num_seqs} test sequences ({num_seqs * seq_len} frames)...")
 
     model.eval()
     model.train_aux_heads(True)
     if model.inventory_embedding_head is not None:
         model.inventory_embedding_head.eval()
 
-    total_cos = 0.0
+    total_cos     = 0.0
     non_empty_cos = 0.0
+    gui_cos       = 0.0   # cos_sim on frames where inventory screen is open
+    closed_cos    = 0.0   # cos_sim on frames where inventory screen is closed (memory-only)
     total_count_mae = 0.0
-    n_total = 0
+    n_total     = 0
     n_non_empty = 0
-    n_count = 0
+    n_gui       = 0
+    n_closed    = 0
+    n_count     = 0
     vocab_set: set = set()
     display_examples = []
+
+    # Build chat template once — same for all frames
+    _dummy = test_loader[0]['frames'][0]
+    chat_text = processor.apply_chat_template(
+        [{"role": "user", "content": [
+            {"type": "image", "image": _dummy},
+            {"type": "text", "text": "What is in the inventory?"},
+        ]}],
+        tokenize=False, add_generation_prompt=True,
+    )
 
     with torch.no_grad():
         for seq_idx in range(num_seqs):
@@ -54,24 +70,20 @@ def evaluate(model, test_loader, processor, args, device):
                 print(f"  seq {seq_idx + 1}/{num_seqs} ...", end='\r', flush=True)
 
             seq = test_loader[seq_idx]
+            seq_len = len(seq['frames'])
             memory = torch.zeros(1, args.memory_dim, device=device, dtype=torch.bfloat16)
+            is_gui_list = seq.get('is_gui_inventory', [False] * seq_len)
 
             for t in range(len(seq['frames'])):
                 frame            = seq['frames'][t]
                 inv_type_target  = seq['inventory_embeddings'][t:t+1].to(device, dtype=torch.bfloat16)
                 inv_count_target = seq['inventory_counts'][t:t+1].to(device)
                 is_non_empty     = seq['inventory_has_items'][t]
+                is_gui_t         = bool(is_gui_list[t])
                 slot_type_texts  = seq.get('inventory_slot_texts',
                                            [['empty slot'] * 36] * len(seq['frames']))[t]
                 slot_counts      = seq['inventory_counts'][t]
 
-                chat_text = processor.apply_chat_template(
-                    [{"role": "user", "content": [
-                        {"type": "image", "image": frame},
-                        {"type": "text", "text": "What is in the inventory?"},
-                    ]}],
-                    tokenize=False, add_generation_prompt=True,
-                )
                 inputs = processor(text=chat_text, images=[frame], return_tensors="pt")
                 inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                           for k, v in inputs.items()}
@@ -96,6 +108,13 @@ def evaluate(model, test_loader, processor, args, device):
                     total_cos += cos_sim
                     n_total += 1
 
+                    if is_gui_t:
+                        gui_cos += cos_sim
+                        n_gui += 1
+                    else:
+                        closed_cos += cos_sim
+                        n_closed += 1
+
                     if is_non_empty:
                         non_empty_cos += cos_sim
                         n_non_empty += 1
@@ -110,10 +129,21 @@ def evaluate(model, test_loader, processor, args, device):
                         if txt != "empty slot":
                             vocab_set.add(txt)
 
-                    if is_non_empty and len(display_examples) < 5:
+                    # Collect one early GUI-open example (model just saw inventory)
+                    # and several late closed-GUI examples (must use memory).
+                    # tick 0 with zero memory tells us nothing — skip early frames.
+                    bucket = None
+                    if is_gui_t and is_non_empty and not any(e['bucket'] == 'gui' for e in display_examples):
+                        bucket = 'gui'
+                    elif not is_gui_t and is_non_empty and t >= seq_len // 3 and \
+                            sum(1 for e in display_examples if e['bucket'] == 'closed') < 4:
+                        bucket = 'closed'
+                    if bucket is not None:
                         display_examples.append({
                             'source': seq.get('source_file', '?'),
                             'tick': t,
+                            'is_gui': is_gui_t,
+                            'bucket': bucket,
                             'mean_cos': cos_sim,
                             'slots': [
                                 (i, slot_type_texts[i],
@@ -130,16 +160,22 @@ def evaluate(model, test_loader, processor, args, device):
 
     avg_cos       = total_cos       / max(n_total,     1)
     avg_ne_cos    = non_empty_cos   / max(n_non_empty, 1)
+    avg_gui_cos   = gui_cos         / max(n_gui,       1)
+    avg_closed_cos= closed_cos      / max(n_closed,    1)
     avg_count_mae = total_count_mae / max(n_count,     1)
     non_empty_pct = 100.0 * n_non_empty / max(n_total, 1)
 
     print(f"\n{'='*70}")
     print(f"TEST SET EVALUATION  ({num_seqs} seqs, {n_total} frames)")
     print(f"{'='*70}")
-    print(f"  Type cos-sim (all frames)   : {avg_cos:.4f}")
-    print(f"  Type cos-sim (non-empty)    : {avg_ne_cos:.4f}"
+    print(f"  Type cos-sim (all frames)      : {avg_cos:.4f}")
+    print(f"  Type cos-sim (non-empty slots) : {avg_ne_cos:.4f}"
           f"  ({n_non_empty}/{n_total} = {non_empty_pct:.1f}%)")
-    print(f"  Count MAE  (non-empty slots): {avg_count_mae:.2f} items")
+    print(f"  Type cos-sim (GUI open)        : {avg_gui_cos:.4f}  ({n_gui} frames)")
+    print(f"  Type cos-sim (GUI closed/mem)  : {avg_closed_cos:.4f}  ({n_closed} frames)  ← key metric")
+    print(f"  GUI-open vs closed gap         : {avg_gui_cos - avg_closed_cos:+.4f}"
+          f"  (should shrink as memory improves)")
+    print(f"  Count MAE  (non-empty slots)   : {avg_count_mae:.2f} items")
 
     if display_examples and vocab_set:
         enc = test_loader.encoder
@@ -152,8 +188,9 @@ def evaluate(model, test_loader, processor, args, device):
         for ex in display_examples:
             gt_items   = {txt for _, txt, _, _, _, _ in ex['slots']}
             pred_items: set = set()
+            gui_label = "[GUI OPEN]" if ex['is_gui'] else "[MEMORY]"
 
-            print(f"\n  [{ex['source']}  tick {ex['tick']}]  type cos={ex['mean_cos']:.3f}")
+            print(f"\n  [{ex['source']}  tick {ex['tick']}  {gui_label}]  type cos={ex['mean_cos']:.3f}")
             for slot_idx, type_text, true_cnt, pred_emb, pred_log_cnt, cs in ex['slots']:
                 pred_cnt = max(0, round(math.exp(pred_log_cnt) - 1))
                 sims = (pred_emb.unsqueeze(0) @ vocab_embs_cpu.T).squeeze(0)
@@ -173,23 +210,30 @@ def evaluate(model, test_loader, processor, args, device):
 
     print(f"{'='*70}")
     return {
-        'eval_cos_sim':           avg_cos,
-        'eval_non_empty_cos_sim': avg_ne_cos,
-        'eval_count_mae':         avg_count_mae,
-        'eval_non_empty_pct':     non_empty_pct,
-        'eval_n_frames':          n_total,
+        'eval_cos_sim':            avg_cos,
+        'eval_non_empty_cos_sim':  avg_ne_cos,
+        'eval_cos_sim_gui':        avg_gui_cos,
+        'eval_cos_sim_closed':     avg_closed_cos,
+        'eval_gui_closed_gap':     avg_gui_cos - avg_closed_cos,
+        'eval_count_mae':          avg_count_mae,
+        'eval_non_empty_pct':      non_empty_pct,
+        'eval_n_frames':           n_total,
+        'eval_n_gui_frames':       n_gui,
+        'eval_n_closed_frames':    n_closed,
     }
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--checkpoint',    required=True, help='Path to .pt checkpoint')
-    parser.add_argument('--data_dir',      default='/data/vvm33/vpt_contractor')
-    parser.add_argument('--train_jsonls',  type=int, default=4400,
+    parser.add_argument('--checkpoint',       required=True, help='Path to .pt checkpoint')
+    parser.add_argument('--data_dir',         default='/data/vvm33/vpt_contractor')
+    parser.add_argument('--train_jsonls',     type=int, default=4000,
                         help='Number of train files (test files start after these)')
-    parser.add_argument('--test_jsonls',   type=int, default=10)
-    parser.add_argument('--memory_dim',    type=int, default=1024)
-    parser.add_argument('--output_json',   default=None,
+    parser.add_argument('--test_jsonls',      type=int, default=5)
+    parser.add_argument('--sequence_length',  type=int, default=200,
+                        help='Frames per eval sequence — match bptt_chunk_size used in training')
+    parser.add_argument('--memory_dim',       type=int, default=1024)
+    parser.add_argument('--output_json',      default=None,
                         help='Optional path to save eval metrics as JSON')
     args = parser.parse_args()
 
@@ -224,7 +268,7 @@ def main():
     encoder = InventoryTextEncoder(device=str(device))
     jsonl_files = sorted(Path(args.data_dir).glob("*.jsonl"))
     test_files  = jsonl_files[args.train_jsonls : args.train_jsonls + args.test_jsonls]
-    test_loader = OnDemandSequenceLoader(test_files, 50, encoder)
+    test_loader = OnDemandSequenceLoader(test_files, args.sequence_length, encoder)
     print(f"  Test sequences: {len(test_loader)}")
 
     metrics = evaluate(model, test_loader, processor, args, device)

@@ -404,19 +404,21 @@ def main():
     parser.add_argument('--test_jsonls', type=int, default=400)
     parser.add_argument('--train_steps', type=int, default=5000)
     parser.add_argument('--eval_every', type=int, default=1000)
-    parser.add_argument('--learning_rate', type=float, default=1e-4)
-    parser.add_argument('--base_model_lr', type=float, default=1e-6)
-    parser.add_argument('--bptt_chunk_size', type=int, default=4)
+    parser.add_argument('--learning_rate', type=float, default=5e-4)
+    parser.add_argument('--base_model_lr', type=float, default=5e-6)
+    parser.add_argument('--bptt_chunk_size', type=int, default=64)
     parser.add_argument('--memory_dim', type=int, default=1024)
-    parser.add_argument('--inventory_weight', type=float, default=1.0,
+    parser.add_argument('--inventory_weight', type=float, default=8.0,
                         help='Scale factor on the InfoNCE type loss')
-    parser.add_argument('--count_weight', type=float, default=0.1,
+    parser.add_argument('--count_weight', type=float, default=4.0,
                         help='Scale factor on the count MSE loss')
-    parser.add_argument('--inv_temperature', type=float, default=0.5,
-                        help='InfoNCE temperature for inventory type loss')
-    parser.add_argument('--lm_weight', type=float, default=1.0,
-                        help='Weight for LM (inventory description) loss; 0 disables it')
-    parser.add_argument('--grad_accum_steps', type=int, default=4)
+    parser.add_argument('--max_norm', type=float, default=50.0,
+                        help='Gradient clip max norm')
+    parser.add_argument('--grad_checkpoint', action='store_true',
+                        help='Enable gradient checkpointing on the backbone. '
+                             'Cuts activation memory ~10x at ~2x compute cost, '
+                             'allowing longer bptt_chunk_size on the same VRAM.')
+    parser.add_argument('--grad_accum_steps', type=int, default=8)
     parser.add_argument('--resume_from', type=str, default=None)
     parser.add_argument('--log_every', type=int, default=10, help='Log metrics every N steps')
     args = parser.parse_args()
@@ -450,45 +452,64 @@ def main():
         trust_remote_code=True,
     )
     
+    if args.grad_checkpoint:
+        # Must be enabled before FSDP wrapping. use_reentrant=False is required
+        # for compatibility with FSDP + custom autograd functions.
+        base_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        if rank == 0:
+            print("  Gradient checkpointing enabled — ~10x less activation memory, ~2x slower")
+
     model = wrap_model_for_stateful_training(
         base_model=base_model,
         memory_dim=args.memory_dim,
         add_inventory_head=True,
         inventory_head_kwargs={'output_dim': 768},
     )
-    
-    # Unfreeze everything
+
+    # All params trainable — backbone at low LR, head+mem at high LR.
+    # The whole point is to teach the backbone to understand the world via
+    # the inventory auxiliary signal, not just to train an inventory head.
     for param in model.parameters():
         param.requires_grad = True
-    
+
     total_params = sum(p.numel() for p in model.parameters())
-    
+
     if rank == 0:
-        print(f"  Total params: {total_params:,}")
-        print(f"  All parameters unfrozen (ViT + LLM + memory + inventory)")
-    
+        print(f"  Total params: {total_params:,}  (all trainable)")
+
     # FSDP setup
     model = model.to(device, dtype=torch.bfloat16)
     model = get_fsdp_model(model, device_id=local_rank)
-    
-    # Optimizer
+
+    # Two param groups: head+memory at high LR, backbone at low LR.
+    # With FSDP use_orig_params=True, original tensors are accessible via
+    # named_parameters() even after wrapping; substring matching works despite
+    # the _fsdp_wrapped_module prefix FSDP may prepend to names.
+    head_param_names = set()
+    for n, _ in model.named_parameters():
+        if 'memory_projections' in n or 'inventory_embedding_head' in n:
+            head_param_names.add(n)
+
+    head_params_list = []
+    backbone_params_list = []
+    for n, p in model.named_parameters():
+        if n in head_param_names:
+            head_params_list.append(p)
+        else:
+            backbone_params_list.append(p)
+
     param_groups = [
-        {'params': [], 'lr': args.learning_rate},
-        {'params': [], 'lr': args.base_model_lr},
+        {'params': head_params_list,     'lr': args.learning_rate},
+        {'params': backbone_params_list, 'lr': args.base_model_lr},
     ]
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            if 'memory_projections' in name or 'inventory_embedding_head' in name:
-                param_groups[0]['params'].append(param)
-            else:
-                param_groups[1]['params'].append(param)
-    
     optimizer = torch.optim.AdamW(param_groups)
-    
+
     if rank == 0:
         print(f"\n[2/5] Optimizer:")
-        print(f"  New params (memory+inventory): LR={args.learning_rate}")
-        print(f"  Base params (ViT+LLM): LR={args.base_model_lr}")
+        print(f"  Head+mem params : LR={args.learning_rate}  ({len(head_params_list)} tensors)")
+        print(f"  Backbone params : LR={args.base_model_lr}  ({len(backbone_params_list)} tensors)")
     
     # Resume if needed
     start_step = 0
@@ -514,8 +535,13 @@ def main():
     jsonl_files = sorted(Path(args.data_dir).glob("*.jsonl"))
     train_files = jsonl_files[:args.train_jsonls]
     test_files  = jsonl_files[args.train_jsonls:args.train_jsonls + args.test_jsonls]
-    train_loader = OnDemandSequenceLoader(train_files, 50, encoder)
-    test_loader  = OnDemandSequenceLoader(test_files,  50, encoder)
+    # Load sequences long enough for one full BPTT chunk.
+    # We load bptt_chunk_size + 100 extra frames so the anchor (gui-open) can
+    # sit anywhere in the first 100 frames and still leave a full bptt_chunk_size
+    # window behind it for the memory to operate over.
+    seq_load_len = args.bptt_chunk_size + 100
+    train_loader = OnDemandSequenceLoader(train_files, seq_load_len, encoder)
+    test_loader  = OnDemandSequenceLoader(test_files,  seq_load_len, encoder)
 
     if rank == 0:
         print(f"  Training sequences: {len(train_loader)}")
@@ -526,65 +552,93 @@ def main():
         print(f"\n[4/5] Training from step {start_step} to {args.train_steps}...")
         print(f"  Logging every {args.log_every} steps")
         print(f"  Checkpointing every {args.eval_every} steps")
-        print(f"\n{'Step':>8} {'Loss':>10} {'LMLoss':>10} {'TypeLoss':>10} {'CntLoss':>10} {'Time':>8}")
-        print("-"*66)
+        print(f"\n{'Step':>8}  {'cos(gui/cls)':>28}  {'cnt':>7}  {'N_ne':>4} {'gui':>4}"
+              f"  {'gN':>6} {'hGN':>7} {'wN':>7} {'mN':>6}  {'Time':>7}")
+        print("-"*105)
     
     step_times = []
-    
+    last_hgn = None   # last inv-head grad norm (from most recent update step)
+    last_wn  = None   # last inv-head weight norm
+    last_gn  = None   # last global grad norm (from most recent update step)
+
+    # Accumulators for smoothed display: averaged over the current update window
+    # (grad_accum_steps chunks).  Reset at each optimizer step so the display
+    # always shows "what did the gradient that just fired actually represent?"
+    win_type_losses  = []
+    win_count_losses = []
+    # Cached smoothed values — shown at every log step even between update steps
+    last_avg_type  = None
+    last_avg_count = None
+
     for step in range(start_step, args.train_steps):
         step_start = time.time()
         
         model.train()
         model.train_aux_heads(True)  # Enable inventory head
         chunk_losses = []
-        chunk_lm_losses = []
         chunk_type_losses = []
         chunk_count_losses = []
+        chunk_n_ne = []              # non-empty slot counts per frame
+        chunk_type_losses_gui    = []   # type loss on frames where inventory screen is open
+        chunk_type_losses_closed = []   # type loss on frames where inventory screen is closed
+        chunk_n_gui = 0              # how many frames had the GUI open this step
 
         memory = torch.zeros(1, args.memory_dim, device=device, dtype=torch.bfloat16)
 
-        seq_idx = torch.randint(0, len(train_loader), (1,)).item()
-        seq = train_loader[seq_idx]
-        start_idx = torch.randint(0, max(1, len(seq['frames']) - args.bptt_chunk_size), (1,)).item()
+        # Find a sequence where the inventory screen is actually open (isGuiInventory)
+        # somewhere in the first 100 frames, then start the BPTT window there.
+        #
+        # The window layout is:
+        #   [anchor=gui_open]  →  [closed] → [closed] → ... (bptt_chunk_size frames)
+        #
+        # Frame 0: inventory screen visible → Qwen gets a direct visual read → memory updates.
+        # Frames 1-N: screen closed → model must use memory to predict inventory.
+        # Loss fires at every frame from JSONL ground truth (screen-open or not).
+        # This is exactly the temporal test we want: "remember what you saw."
+        for _seq_retry in range(20):
+            seq_idx = torch.randint(0, len(train_loader), (1,)).item()
+            seq = train_loader[seq_idx]
+            gui_open = seq['is_gui_inventory']   # List[bool], len = seq_load_len
+            # Only look in the first 100 frames so the full bptt_chunk_size fits after
+            searchable = min(100, len(gui_open) - args.bptt_chunk_size)
+            open_frames = [i for i in range(searchable) if gui_open[i]]
+            if open_frames:
+                break
+        if not open_frames:
+            # No gui-open frame found — fall back to frame 0 (model trains from scratch)
+            start_idx = 0
+        else:
+            anchor = open_frames[torch.randint(0, len(open_frames), (1,)).item()]
+            start_idx = anchor
 
         scale = args.bptt_chunk_size * args.grad_accum_steps
+
+        # Build the chat template string once — text never changes between frames.
+        # Only pixel_values differs per frame, so we can reuse chat_text across
+        # the entire inner loop.
+        _dummy_frame = seq['frames'][start_idx]
+        chat_text = processor.apply_chat_template(
+            [{"role": "user", "content": [
+                {"type": "image", "image": _dummy_frame},
+                {"type": "text", "text": "What is in the inventory?"},
+            ]}],
+            tokenize=False, add_generation_prompt=True,
+        )
+
+        # True BPTT: accumulate loss across all frames in the window, then call
+        # backward ONCE.  Memory is NOT detached between frames so gradients flow
+        # back through the GRU recurrence.  This is what actually teaches the GRU
+        # to hold information: "you needed to remember what you saw at frame 0 to
+        # predict inventory correctly at frame 150."
+        seq_loss = None   # tensor — accumulates the computation graph
 
         for t in range(start_idx, min(start_idx + args.bptt_chunk_size, len(seq['frames']))):
             frame = seq['frames'][t]
             inv_type_target  = seq['inventory_embeddings'][t:t+1].to(device, dtype=torch.bfloat16)  # [1, 36, 768]
             inv_count_target = seq['inventory_counts'][t:t+1].to(device)      # [1, 36] long
 
-            # Build inventory description for LM supervision.
-            # Random question + prefix so the model can't short-circuit on phrasing.
-            question      = random.choice(INVENTORY_QUESTION_PROMPTS)
-            answer_prefix = random.choice(INVENTORY_ANSWER_PREFIXES)
-            slot_type_texts_t = seq.get(
-                'inventory_slot_texts',
-                [['empty slot'] * 36] * len(seq['frames']),
-            )[t]
-            slot_counts_cpu = seq['inventory_counts'][t].tolist()
-            answer = build_inventory_answer(slot_type_texts_t, slot_counts_cpu, answer_prefix)
-
-            # Full conversation (user + assistant) — model learns to generate the answer.
-            chat_text = processor.apply_chat_template(
-                [
-                    {"role": "user", "content": [
-                        {"type": "image", "image": frame},
-                        {"type": "text", "text": question},
-                    ]},
-                    {"role": "assistant", "content": answer},
-                ],
-                tokenize=False, add_generation_prompt=False,
-            )
             inputs = processor(text=chat_text, images=[frame], return_tensors="pt")
             inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-
-            # Label mask: -100 for all prompt/image tokens; only supervise answer tokens.
-            # We tokenize the answer in isolation to count its tokens, then mask the prefix.
-            n_ans  = len(processor.tokenizer(answer, add_special_tokens=False)['input_ids'])
-            labels = inputs['input_ids'].clone()
-            labels[:, :-n_ans] = -100
-            labels = labels.to(device)
 
             outputs = model(
                 input_ids=inputs.get('input_ids'),
@@ -592,16 +646,14 @@ def main():
                 image_grid_thw=inputs.get('image_grid_thw'),
                 prev_memory=memory,
                 attention_mask=inputs.get('attention_mask'),
-                labels=labels,
+                labels=None,
             )
 
-            memory_reg = 0.01 * (outputs.new_memory ** 2).mean()
-            step_loss = memory_reg / scale  # base: always backprop memory reg
+            # No detach — memory carries the gradient graph across frames.
+            memory = outputs.new_memory
 
-            # LM loss: outputs.main_loss is CE only (memory_reg already in step_loss above).
-            if outputs.main_loss is not None and args.lm_weight > 0:
-                step_loss = step_loss + args.lm_weight * outputs.main_loss / scale
-                chunk_lm_losses.append(outputs.main_loss.item())
+            memory_reg = 0.01 * (memory ** 2).mean()
+            frame_loss = memory_reg / scale
 
             if outputs.inventory_embedding is not None:
                 pred_type  = outputs.inventory_embedding[0]   # [36, 768]
@@ -611,61 +663,48 @@ def main():
 
                 non_empty = tgt_count > 0                      # [36] bool mask
                 N_ne = int(non_empty.sum().item())
+                chunk_n_ne.append(N_ne)
 
-                # --- Type loss: InfoNCE over unique item types in this frame ---
-                # pred and tgt are already L2-normalised by the inventory head.
-                # We deduplicate by target embedding before forming the similarity
-                # matrix: if two slots share the same item type their trigram
-                # embeddings are bit-identical, which would create contradictory
-                # gradients (push pred[i] toward V AND away from V simultaneously).
-                # Dedup removes all but the first occurrence so every off-diagonal
-                # entry in the matrix is a genuinely different item type.
-                if N_ne >= 2:
-                    ne_pred = pred_type[non_empty]   # [N_ne, 768] unit vectors
-                    ne_tgt  = tgt_type[non_empty]    # [N_ne, 768] unit vectors
-
-                    # Drop duplicate item types (cos_sim > 0.999 → identical trigram emb)
-                    tgt_sim = ne_tgt @ ne_tgt.T
-                    unique_mask = torch.ones(N_ne, dtype=torch.bool, device=device)
-                    for i in range(1, N_ne):
-                        if (tgt_sim[i, :i] > 0.999).any():
-                            unique_mask[i] = False
-                    ne_pred_u = ne_pred[unique_mask]
-                    ne_tgt_u  = ne_tgt[unique_mask]
-                    N_u = int(unique_mask.sum())
-
-                    if N_u >= 2:
-                        logits   = (ne_pred_u @ ne_tgt_u.T) / args.inv_temperature
-                        type_loss = F.cross_entropy(logits, torch.arange(N_u, device=device))
-                    else:
-                        # Only one unique type after dedup — fall back to cosine
-                        type_loss = 1.0 - (ne_pred_u * ne_tgt_u).sum(dim=-1).mean()
-                elif N_ne == 1:
-                    type_loss = 1.0 - (pred_type[non_empty] * tgt_type[non_empty]).sum(dim=-1).mean()
-                else:
-                    type_loss = None
+                # --- Type loss: per-slot -log((1+cos_sim)/2) over ALL 36 slots ---
+                cos_sim_all = (pred_type * tgt_type).sum(dim=-1)   # [36]
+                type_loss = -torch.log((1.0 + cos_sim_all) / 2.0 + 1e-8).mean()
 
                 # --- Count loss: MSE on log(count+1) for non-empty slots ---
+                count_loss = None
                 if N_ne > 0:
                     count_loss = F.mse_loss(
                         pred_count[non_empty],
                         torch.log(tgt_count[non_empty] + 1).to(pred_count.dtype),
                     )
-                else:
-                    count_loss = None
 
-                if type_loss is not None:
-                    step_loss = step_loss + args.inventory_weight * type_loss / scale
-                    chunk_type_losses.append(type_loss.item())
+                frame_loss = frame_loss + args.inventory_weight * type_loss / scale
+                tl_val = type_loss.item()
+                chunk_type_losses.append(tl_val)
+                is_gui_t = seq['is_gui_inventory'][t]
+                if is_gui_t:
+                    chunk_type_losses_gui.append(tl_val)
+                    chunk_n_gui += 1
+                else:
+                    chunk_type_losses_closed.append(tl_val)
                 if count_loss is not None:
-                    step_loss = step_loss + args.count_weight * count_loss / scale
+                    frame_loss = frame_loss + args.count_weight * count_loss / scale
                     chunk_count_losses.append(count_loss.item())
 
-            step_loss.backward()
-            chunk_losses.append(step_loss.item() * scale)
+            seq_loss = frame_loss if seq_loss is None else seq_loss + frame_loss
+            chunk_losses.append(frame_loss.item() * scale)  # display (forces CUDA sync)
 
-            memory = outputs.new_memory.detach()
-        
+        # Snapshot memory norm before backward frees the graph.
+        memory_norm_end = memory.detach().float().norm().item()
+
+        # Single backward through the full bptt_chunk_size frame sequence.
+        # Gradient flows back through GRU recurrence across all frames.
+        if seq_loss is not None:
+            seq_loss.backward()
+
+        # Feed this chunk into the update-window accumulators
+        win_type_losses.extend(chunk_type_losses)
+        win_count_losses.extend(chunk_count_losses)
+
         # Gradient accumulation: accumulate for grad_accum_steps outer steps before
         # updating.  The loss is already divided by (bptt_chunk_size * grad_accum_steps)
         # so after grad_accum_steps steps the effective batch covers
@@ -676,36 +715,110 @@ def main():
         )
 
         grad_norm = None
+        inv_head_grad_norm = None
+        inv_head_weight_norm = None
         if is_update_step and chunk_losses:
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # Per-component grad norm BEFORE clipping.
+            # With FSDP FULL_SHARD + use_orig_params=True, each rank holds only a
+            # SHARD of each parameter.  Rank 0 typically holds the first flat-param
+            # shard (mostly ViT + embedding params) and has p.grad=None for the
+            # inventory head.  We must all-reduce the per-rank squared norms to get
+            # the true global gradient norm.
+            head_sq_norm = torch.tensor(0.0, device=device)
+            head_w_sq_norm = torch.tensor(0.0, device=device)
+            for n, p in model.named_parameters():
+                is_head_param = 'inventory_embedding_head' in n or 'memory_projections' in n
+                if is_head_param:
+                    if p.grad is not None:
+                        head_sq_norm += p.grad.detach().float().pow(2).sum()
+                    if 'inventory_embedding_head' in n:
+                        head_w_sq_norm += p.detach().float().pow(2).sum()
+            if world_size > 1:
+                dist.all_reduce(head_sq_norm,   op=dist.ReduceOp.SUM)
+                dist.all_reduce(head_w_sq_norm, op=dist.ReduceOp.SUM)
+            _gn = float(head_sq_norm.sqrt().item())
+            inv_head_grad_norm   = _gn if _gn > 1e-12 else None
+            inv_head_weight_norm = float(head_w_sq_norm.sqrt().item())
+            # Cache for display on non-update log steps
+            last_hgn = inv_head_grad_norm
+            last_wn  = inv_head_weight_norm
+
+            # Debug: at the very first update step, dump param group sizes and
+            # confirm inventory head params have correct names / are in group 0.
+            if step < start_step + args.grad_accum_steps and rank == 0:
+                inv_names = [n for n, p in model.named_parameters()
+                             if 'inventory_embedding_head' in n]
+                print(f"\n[DEBUG step {step}] inv head param tensors: {len(inv_names)}"
+                      f"  (e.g. {inv_names[0] if inv_names else 'NONE FOUND'})")
+                print(f"[DEBUG step {step}] head_sq_norm={head_sq_norm.item():.4f}"
+                      f"  hGN={inv_head_grad_norm}  wN={inv_head_weight_norm:.4f}")
+
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_norm)
+            last_gn = float(grad_norm.item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm or 0.0)
             optimizer.step()
             optimizer.zero_grad()
+
+            # Compute smoothed display values from the just-completed update window
+            # and reset the accumulators for the next window.
+            last_avg_type  = sum(win_type_losses)  / len(win_type_losses)  if win_type_losses  else None
+            last_avg_count = sum(win_count_losses) / len(win_count_losses) if win_count_losses else None
+            win_type_losses.clear()
+            win_count_losses.clear()
 
         if chunk_losses:
             losses.append(sum(chunk_losses))
 
             avg_loss       = sum(chunk_losses)
-            avg_lm_loss    = sum(chunk_lm_losses)    / len(chunk_lm_losses)    if chunk_lm_losses    else 0.0
             avg_type_loss  = sum(chunk_type_losses)  / len(chunk_type_losses)  if chunk_type_losses  else 0.0
             avg_count_loss = sum(chunk_count_losses) / len(chunk_count_losses) if chunk_count_losses else 0.0
+            avg_n_ne       = sum(chunk_n_ne)         / len(chunk_n_ne)         if chunk_n_ne         else 0.0
+            # GUI vs closed type-loss → cos_sim.  The KEY diagnostic:
+            # closed-frame cos_sim should improve over training even though the
+            # model cannot see the inventory screen (must rely on memory).
+            _tl_gui    = sum(chunk_type_losses_gui)    / len(chunk_type_losses_gui)    if chunk_type_losses_gui    else None
+            _tl_closed = sum(chunk_type_losses_closed) / len(chunk_type_losses_closed) if chunk_type_losses_closed else None
+            cos_gui    = 2.0 * math.exp(-_tl_gui)    - 1.0 if _tl_gui    is not None else None
+            cos_closed = 2.0 * math.exp(-_tl_closed) - 1.0 if _tl_closed is not None else None
 
             step_time = time.time() - step_start
             step_times.append(step_time)
 
             metrics = {
-                'loss': avg_loss,
-                'lm_loss': avg_lm_loss,
-                'type_loss': avg_type_loss,
-                'count_loss': avg_count_loss,
-                'grad_norm': grad_norm.item() if isinstance(grad_norm, torch.Tensor) else (grad_norm or 0.0),
-                'step_time': step_time,
-                'is_update_step': is_update_step,
+                'loss':               avg_loss,
+                'type_loss':          avg_type_loss,
+                'count_loss':         avg_count_loss,
+                'n_ne_avg':           avg_n_ne,
+                'n_gui_frames':       chunk_n_gui,
+                # cos_sim_gui:   how well the model reads inventory from the visual
+                # cos_sim_closed: how well memory retains inventory when screen is closed
+                # The gap between these should CLOSE over training as memory improves.
+                'cos_sim_gui':        cos_gui    if cos_gui    is not None else 0.0,
+                'cos_sim_closed':     cos_closed if cos_closed is not None else 0.0,
+                'memory_norm':        memory_norm_end,
+                'grad_norm':          last_gn or 0.0,
+                'inv_head_grad_norm': inv_head_grad_norm or 0.0,
+                'inv_head_weight_norm': inv_head_weight_norm or 0.0,
+                'step_time':          step_time,
+                'is_update_step':     is_update_step,
             }
 
             logger.log(metrics, step)
 
             if rank == 0 and step % args.log_every == 0:
-                print(f"{step:>8} {avg_loss:>10.4f} {avg_lm_loss:>10.4f} {avg_type_loss:>10.4f} {avg_count_loss:>10.4f} {step_time:>8.2f}s")
+                gn_str  = f"{last_gn:.1f}"  if last_gn  is not None else "  N/A"
+                hgn_str = f"{last_hgn:.3f}" if last_hgn is not None else "  N/A"
+                wn_str  = f"{last_wn:.3f}"  if last_wn  is not None else "    N/A"
+                # Use smoothed (update-window averaged) values for display
+                disp_type  = last_avg_type  if last_avg_type  is not None else avg_type_loss
+                disp_count = last_avg_count if last_avg_count is not None else avg_count_loss
+                cos_display  = 2.0 * math.exp(-disp_type) - 1.0
+                gui_str    = f"{cos_gui:+.3f}"    if cos_gui    is not None else "  N/A"
+                closed_str = f"{cos_closed:+.3f}" if cos_closed is not None else "  N/A"
+                flag = "  *** NO GUI ***" if chunk_n_gui == 0 else ""
+                print(f"{step:>8} cos={cos_display:+.3f}(gui={gui_str} cls={closed_str})"
+                      f"  cnt={disp_count:.4f}  N_ne={avg_n_ne:4.1f} gui={chunk_n_gui:3d}"
+                      f"  gN={gn_str} hGN={hgn_str} wN={wn_str} mN={memory_norm_end:.2f}"
+                      f"  {step_time:>6.1f}s{flag}")
 
         # Checkpoint
         if (step + 1) % args.eval_every == 0:

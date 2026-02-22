@@ -3,11 +3,12 @@
 Plot training metrics from JSON Lines log file.
 
 Usage:
-    python plot_metrics.py /data/vvm33/checkpoints/full_unfrozen_fsdp/metrics.jsonl
-    python plot_metrics.py metrics.jsonl -o training_plot.png
+    python jarvisvla/train/plot_metrics.py /data/vvm33/checkpoints/train_inv_head/metrics.jsonl
+    python jarvisvla/train/plot_metrics.py metrics.jsonl -o training_plot.png
 """
 
 import json
+import math
 import argparse
 from pathlib import Path
 import matplotlib
@@ -41,13 +42,11 @@ def smooth(data, window=20):
     return smoothed
 
 
-def plot_series(ax, steps, values, label, color, title, ylabel, logy=False, hline=None):
+def plot_series(ax, steps, values, label, color, title, ylabel, logy=False):
     raw = [v if v is not None else float('nan') for v in values]
     sm  = smooth(raw)
-    ax.plot(steps, raw, alpha=0.25, color=color, linewidth=0.6)
-    ax.plot(steps, sm,  color=color, linewidth=2, label=f'Smoothed (w=20)')
-    if hline is not None:
-        ax.axhline(y=hline, linestyle='--', color='red', alpha=0.5)
+    ax.plot(steps, raw, alpha=0.2, color=color, linewidth=0.6)
+    ax.plot(steps, sm,  color=color, linewidth=2, label=label)
     ax.set_xlabel('Step')
     ax.set_ylabel(ylabel)
     ax.set_title(title)
@@ -60,97 +59,100 @@ def plot_series(ax, steps, values, label, color, title, ylabel, logy=False, hlin
     ax.grid(True, alpha=0.3)
 
 
-def make_random_walk(losses, step=1.0):
-    """Random walk seeded at the first valid loss value, stepping ±U(0, step) each step."""
-    rng = np.random.default_rng()
-    rw = [None] * len(losses)
-    first = next((i for i, v in enumerate(losses) if v is not None), None)
-    if first is None:
-        return rw
-    rw[first] = losses[first]
-    for i in range(first + 1, len(losses)):
-        rw[i] = rw[i - 1] + rng.uniform(-step, step)
-    return rw
-
-
 def create_plot(metrics, output_file):
-    steps      = [m['step']                        for m in metrics]
-    losses     = [m.get('loss')                    for m in metrics]
-    lm_losses  = [m['lm_loss']  if m.get('lm_loss',  0) > 0 else None for m in metrics]
-    type_losses= [m['type_loss'] if m.get('type_loss', 0) > 0 else None for m in metrics]
-    cnt_losses = [m['count_loss'] if m.get('count_loss', 0) > 0 else None for m in metrics]
-    step_times = [m.get('step_time', 0)            for m in metrics]
+    steps      = [m['step']                  for m in metrics]
+    type_losses= [m.get('type_loss')         for m in metrics]
+    cnt_losses = [m.get('count_loss')        for m in metrics]
+    n_ne_vals  = [m.get('n_ne_avg', 0)       for m in metrics]
+    n_gui_vals = [m.get('n_gui_frames', 0)   for m in metrics]
+    step_times = [m.get('step_time', 0)      for m in metrics]
+    mem_norms  = [m.get('memory_norm', 0)    for m in metrics]
 
-    rw_losses  = make_random_walk(cnt_losses, step=0.3)
+    # cos_sim: recovered from type_loss, or stored directly
+    cos_all    = [2.0 * math.exp(-m['type_loss']) - 1.0
+                  if m.get('type_loss') else None for m in metrics]
+    cos_gui    = [m.get('cos_sim_gui')    for m in metrics]
+    cos_closed = [m.get('cos_sim_closed') for m in metrics]
 
-    fig, axes = plt.subplots(4, 2, figsize=(16, 18))
-    fig.suptitle('JarvisVLA Training — LM + type/count inventory heads', fontsize=14, fontweight='bold')
+    update_steps = [m['step'] for m in metrics if m.get('is_update_step')]
+    update_gn    = [m['grad_norm']          for m in metrics if m.get('is_update_step') and m.get('grad_norm', 0) > 0]
+    update_gn_s  = [m['step']              for m in metrics if m.get('is_update_step') and m.get('grad_norm', 0) > 0]
+    update_hgn   = [m['inv_head_grad_norm'] for m in metrics if m.get('is_update_step')]
 
-    # Row 0
-    plot_series(axes[0,0], steps, losses,      'loss',      'steelblue',  'Total Loss',                    'Loss',    logy=True)
-    plot_series(axes[0,1], steps, lm_losses,   'lm_loss',   'darkorange', 'LM Loss (inventory description CE)', 'Loss', logy=False)
+    fig, axes = plt.subplots(4, 2, figsize=(16, 20))
+    fig.suptitle('JarvisVLA — Inventory Memory Training', fontsize=14, fontweight='bold')
 
-    # Row 1
-    plot_series(axes[1,0], steps, type_losses, 'type_loss', 'darkorchid', 'Type Loss (InfoNCE)',            'Loss',    logy=False)
-    plot_series(axes[1,1], steps, cnt_losses,  'cnt_loss',  'seagreen',   'Count Loss (log-MSE)',           'Loss',    logy=False)
+    # ── Row 0: Type loss  |  GUI vs Closed cos_sim (THE key diagnostic) ──────
+    plot_series(axes[0,0], steps, type_losses, 'type loss', 'darkorchid',
+                'Type Loss  (-log cosine, all 36 slots)', 'Loss')
 
-    # Row 2 — grad norm + random walk reference for count loss
-    update_steps_gn = [m['step'] for m in metrics if m.get('is_update_step') and m.get('grad_norm', 0) > 0]
-    update_gn_vals  = [m['grad_norm'] for m in metrics if m.get('is_update_step') and m.get('grad_norm', 0) > 0]
-    ax = axes[2,0]
-    if update_steps_gn:
-        ax.scatter(update_steps_gn, update_gn_vals, s=12, color='tomato', alpha=0.5, zorder=3)
-        ax.plot(update_steps_gn, smooth(update_gn_vals), color='tomato', linewidth=2)
+    ax = axes[0,1]
+    cos_all_v    = [v if v is not None else float('nan') for v in cos_all]
+    cos_gui_v    = [v if v is not None else float('nan') for v in cos_gui]
+    cos_closed_v = [v if v is not None else float('nan') for v in cos_closed]
+    ax.plot(steps, cos_all_v,    alpha=0.15, color='gray',        linewidth=0.5)
+    ax.plot(steps, smooth(cos_all_v),    color='gray',        linewidth=1.5, label='cos_sim (all)',    linestyle='--')
+    ax.plot(steps, cos_gui_v,    alpha=0.15, color='steelblue',   linewidth=0.5)
+    ax.plot(steps, smooth(cos_gui_v),    color='steelblue',   linewidth=2,   label='cos_sim GUI open')
+    ax.plot(steps, cos_closed_v, alpha=0.15, color='tomato',      linewidth=0.5)
+    ax.plot(steps, smooth(cos_closed_v), color='tomato',      linewidth=2,   label='cos_sim GUI closed (memory)')
+    ax.axhline(y=0, linestyle=':', color='black', alpha=0.3)
     ax.set_xlabel('Step')
-    ax.set_ylabel('Norm')
-    ax.set_title('Gradient Norm (update steps only)')
+    ax.set_ylabel('cos_sim')
+    ax.set_title('GUI-open vs Closed cos_sim\n'
+                 'KEY: closed (red) should rise as memory learns to retain inventory')
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    plot_series(axes[2,1], steps, rw_losses, 'rw', 'slategray',
-                'Random ±0.3/step Walk ref\n(same start, same axis as count loss)', 'Loss', logy=False)
-    axes[2,1].set_ylim(axes[1,1].get_ylim())
+    # ── Row 1: Count loss  |  Global grad norm ───────────────────────────────
+    plot_series(axes[1,0], steps, cnt_losses, 'count loss', 'seagreen',
+                'Count Loss  (log-MSE, non-empty slots only)', 'Loss')
 
-    # Row 3 — step time + summary
-    plot_series(axes[3,1], steps, step_times, 'time', 'gray', 'Step Time', 'Seconds', logy=False)
+    ax = axes[1,1]
+    if update_gn_s:
+        ax.scatter(update_gn_s, update_gn,          s=10, color='tomato', alpha=0.4, zorder=3)
+        ax.plot(update_gn_s,    smooth(update_gn),  color='tomato', linewidth=2, label='global gN')
+    ax.set_xlabel('Step')
+    ax.set_ylabel('Norm')
+    ax.set_title('Global Gradient Norm  (update steps only)')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
 
-    # Update-step markers on loss plot
-    update_steps = [m['step'] for m in metrics if m.get('is_update_step')]
+    # ── Row 2: Inv-head grad norm  |  Memory norm ────────────────────────────
+    ax = axes[2,0]
     if update_steps:
-        update_losses = [losses[steps.index(s)] for s in update_steps if losses[steps.index(s)] is not None]
-        axes[0,0].scatter(update_steps, update_losses, s=8, color='red', zorder=5, alpha=0.4, label='Update step')
-        axes[0,0].legend(fontsize=8)
+        ax.scatter(update_steps, update_hgn,           s=10, color='darkorange', alpha=0.4, zorder=3)
+        ax.plot(update_steps,    smooth(update_hgn),   color='darkorange', linewidth=2, label='inv-head gN')
+    ax.set_xlabel('Step')
+    ax.set_ylabel('Norm')
+    ax.set_title('Inventory Head Grad Norm\n(should stay > 0; collapse = head stopped learning)')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
 
+    ax = axes[2,1]
+    ax.plot(steps, mem_norms, alpha=0.25, color='mediumpurple', linewidth=0.6)
+    ax.plot(steps, smooth(mem_norms), color='mediumpurple', linewidth=2, label='memory L2 norm')
+    ax.set_xlabel('Step')
+    ax.set_ylabel('L2 norm')
+    ax.set_title('Memory Vector Norm\n(explosion/collapse = GRU instability)')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # ── Row 3: Data quality (N_ne, N_gui)  |  Step time ─────────────────────
     ax = axes[3,0]
-    ax.axis('off')
-    valid_losses = [v for v in losses if v is not None]
-    valid_lm     = [v for v in lm_losses  if v is not None]
-    valid_type   = [v for v in type_losses if v is not None]
-    valid_cnt    = [v for v in cnt_losses  if v is not None]
-    lines = [
-        f"Steps logged:     {len(metrics)}",
-        f"Loss  init/final: {valid_losses[0]:.4f} → {valid_losses[-1]:.4f}",
-        f"Loss  min:        {min(valid_losses):.4f}",
-    ]
-    if valid_lm:
-        lines += [
-            f"LMLoss  avg:      {np.mean(valid_lm):.4f}",
-            f"LMLoss  min:      {min(valid_lm):.4f}",
-        ]
-    if valid_type:
-        lines += [
-            f"TypeLoss avg:     {np.mean(valid_type):.4f}",
-            f"TypeLoss min:     {min(valid_type):.4f}",
-        ]
-    if valid_cnt:
-        lines += [
-            f"CntLoss  avg:     {np.mean(valid_cnt):.4f}",
-            f"CntLoss  min:     {min(valid_cnt):.4f}",
-        ]
-    if step_times:
-        lines.append(f"Avg step time:    {np.mean(step_times):.2f}s")
-    ax.text(0.05, 0.95, '\n'.join(lines), transform=ax.transAxes,
-            fontsize=11, verticalalignment='top', fontfamily='monospace',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    ax.plot(steps, n_ne_vals,  alpha=0.25, color='cornflowerblue', linewidth=0.6)
+    ax.plot(steps, smooth(n_ne_vals),  color='cornflowerblue', linewidth=2, label='N_ne (non-empty slots)')
+    ax.plot(steps, n_gui_vals, alpha=0.25, color='gold', linewidth=0.6)
+    ax.plot(steps, smooth(n_gui_vals), color='gold',         linewidth=2, label='N_gui (GUI-open frames in window)')
+    ax.set_xlabel('Step')
+    ax.set_ylabel('Frames / Slots')
+    ax.set_title('Data Quality: Inventory Richness + GUI Frames per Window\n'
+                 'N_gui=0 every step → anchor sampling failed, check is_gui_inventory')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    plot_series(axes[3,1], steps, step_times, 'step time', 'gray',
+                'Step Time per Outer Step', 'Seconds')
 
     plt.tight_layout()
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
@@ -177,11 +179,16 @@ def main():
     output = args.output or str(path.with_suffix('.png'))
     create_plot(metrics, output)
 
-    valid = [m for m in metrics if m.get('loss') is not None]
-    losses = [m['loss'] for m in valid]
-    print(f"\nSummary:")
-    print(f"  Steps:  {len(metrics)}")
-    print(f"  Loss:   {losses[0]:.4f} → {losses[-1]:.4f}  (min {min(losses):.4f})")
+    valid  = [m for m in metrics if m.get('type_loss')]
+    t_vals = [m['type_loss'] for m in valid]
+    c_vals = [m['count_loss'] for m in valid if m.get('count_loss')]
+    print(f"\nSummary ({len(metrics)} steps):")
+    if t_vals:
+        cos_i = 2.0 * math.exp(-t_vals[0])  - 1.0
+        cos_f = 2.0 * math.exp(-t_vals[-1]) - 1.0
+        print(f"  cos_sim:  {cos_i:+.4f} → {cos_f:+.4f}  (type_loss {t_vals[0]:.4f} → {t_vals[-1]:.4f})")
+    if c_vals:
+        print(f"  cnt_loss: {c_vals[0]:.4f} → {c_vals[-1]:.4f}  (min {min(c_vals):.4f})")
 
 
 if __name__ == '__main__':
