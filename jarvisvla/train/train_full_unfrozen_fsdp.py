@@ -141,31 +141,47 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-def get_fsdp_model(model, device_id):
-    """Wrap model with FSDP."""
+def get_fsdp_model(model, device_id, frozen_backbone: bool = False):
+    """Wrap model with FSDP.
+
+    Sharding strategy:
+      SHARD_GRAD_OP (ZeRO-2, default, unfrozen backbone):
+        Parameters stay replicated during forward and backward; only gradients
+        and optimizer state are sharded.  FULL_SHARD all-gathers on *every*
+        forward AND backward pass.  With 4×80 GB GPUs and ~16.6 GB model in
+        bf16, params fit replicated — this removes roughly half the all-gather
+        overhead vs FULL_SHARD.
+
+      FULL_SHARD (ZeRO-3, frozen backbone):
+        With --frozen_backbone, the 8 B backbone parameters don't need to be
+        replicated (no gradient computation for them).  FULL_SHARD shards the
+        frozen params across GPUs, saving ~12 GB/GPU, at the cost of one extra
+        all-gather per forward.  The head+memory params are tiny and the
+        backbone all-gather during forward is unavoidable anyway.
+    """
     mp_policy = MixedPrecision(
         param_dtype=torch.bfloat16,
         reduce_dtype=torch.bfloat16,
         buffer_dtype=torch.bfloat16,
     )
-    
+
     def wrap_policy_fn(module):
-        if isinstance(module, Qwen2VLDecoderLayer):
-            return True
-        return False
-    
+        return isinstance(module, Qwen2VLDecoderLayer)
+
     auto_wrap_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=wrap_policy_fn)
-    
+
+    strategy = ShardingStrategy.FULL_SHARD if frozen_backbone else ShardingStrategy.SHARD_GRAD_OP
+
     model = FSDP(
         model,
         device_id=device_id,
         auto_wrap_policy=auto_wrap_policy,
         mixed_precision=mp_policy,
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        sharding_strategy=strategy,
         limit_all_gathers=True,
         use_orig_params=True,
     )
-    
+
     return model
 
 
@@ -235,6 +251,20 @@ def evaluate_on_test_set(model, test_loader, processor, args, device, rank, logg
             seq = test_loader[seq_idx]
             memory = torch.zeros(1, args.memory_dim, device=device, dtype=torch.bfloat16)
 
+            # Tokenise once per sequence — text is constant, only pixel_values
+            # differ per frame.  Same optimisation as the training inner loop.
+            _ref_frame   = seq['frames'][0]
+            _eval_chat   = processor.apply_chat_template(
+                [{"role": "user", "content": [
+                    {"type": "image", "image": _ref_frame},
+                    {"type": "text", "text": "What is in the inventory?"},
+                ]}],
+                tokenize=False, add_generation_prompt=True,
+            )
+            _eval_static  = processor(text=_eval_chat, images=[_ref_frame], return_tensors="pt")
+            _eval_inp_ids = _eval_static['input_ids'].to(device)
+            _eval_attn    = _eval_static['attention_mask'].to(device)
+
             for t in range(len(seq['frames'])):
                 frame            = seq['frames'][t]
                 inv_type_target  = seq['inventory_embeddings'][t:t+1].to(device, dtype=torch.bfloat16)  # [1,36,768]
@@ -244,23 +274,17 @@ def evaluate_on_test_set(model, test_loader, processor, args, device, rank, logg
                                            [['empty slot']*36]*len(seq['frames']))[t]
                 slot_counts      = seq['inventory_counts'][t]  # [36] long, cpu
 
-                chat_text = processor.apply_chat_template(
-                    [{"role": "user", "content": [
-                        {"type": "image", "image": frame},
-                        {"type": "text", "text": "What is in the inventory?"},
-                    ]}],
-                    tokenize=False, add_generation_prompt=True,
-                )
-                inputs = processor(text=chat_text, images=[frame], return_tensors="pt")
-                inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                          for k, v in inputs.items()}
+                # Per-frame: only pixel values need reprocessing
+                _img_out = processor.image_processor(images=[frame], return_tensors="pt")
+                _pv      = _img_out['pixel_values'].to(device)
+                _thw     = _img_out['image_grid_thw'].to(device) if 'image_grid_thw' in _img_out else None
 
                 outputs = model(
-                    input_ids=inputs.get('input_ids'),
-                    pixel_values=inputs.get('pixel_values'),
-                    image_grid_thw=inputs.get('image_grid_thw'),
+                    input_ids=_eval_inp_ids,
+                    pixel_values=_pv,
+                    image_grid_thw=_thw,
                     prev_memory=memory,
-                    attention_mask=inputs.get('attention_mask'),
+                    attention_mask=_eval_attn,
                     labels=None,
                 )
 
@@ -406,19 +430,36 @@ def main():
     parser.add_argument('--eval_every', type=int, default=1000)
     parser.add_argument('--learning_rate', type=float, default=5e-4)
     parser.add_argument('--base_model_lr', type=float, default=5e-6)
-    parser.add_argument('--bptt_chunk_size', type=int, default=64)
+    # Trinh et al. (ICML 2018) show auxiliary losses on the hidden state create
+    # local gradient flow that makes short truncation nearly as effective as
+    # full BPTT — exactly our setup.  Backbone gradient signal through the GRU
+    # vanishes beyond ~4–8 steps due to standard recurrent gradient decay.
+    # Paying for 64-step backbone BPTT is 8× more expensive for negligible
+    # extra signal.  The GRU memory still carries information across 64+ frames;
+    # only the optimizer's credit-assignment window is truncated.
+    # Effective batch = bptt_chunk_size × grad_accum_steps = 8 × 64 = 512 frames
+    # (same as the old 64 × 8 = 512 default).
+    parser.add_argument('--bptt_chunk_size', type=int, default=8)
     parser.add_argument('--memory_dim', type=int, default=1024)
     parser.add_argument('--inventory_weight', type=float, default=8.0,
                         help='Scale factor on the InfoNCE type loss')
     parser.add_argument('--count_weight', type=float, default=4.0,
                         help='Scale factor on the count MSE loss')
-    parser.add_argument('--max_norm', type=float, default=50.0,
+    parser.add_argument('--max_norm', type=float, default=1.0,
                         help='Gradient clip max norm')
     parser.add_argument('--grad_checkpoint', action='store_true',
                         help='Enable gradient checkpointing on the backbone. '
                              'Cuts activation memory ~10x at ~2x compute cost, '
                              'allowing longer bptt_chunk_size on the same VRAM.')
-    parser.add_argument('--grad_accum_steps', type=int, default=8)
+    parser.add_argument('--grad_accum_steps', type=int, default=64)
+    parser.add_argument('--frozen_backbone', action='store_true',
+                        help='Freeze all backbone (Qwen2-VL) parameters — only GRU memory '
+                             'projections and inventory head train.  SPEED ABLATION ONLY: '
+                             'the research hypothesis requires an unfrozen backbone for '
+                             'co-adaptation.  Use this to verify the head converges and '
+                             'establish a frozen-backbone baseline before expecting backbone '
+                             'world-state encoding.  Automatically switches to FULL_SHARD '
+                             'to avoid replicating 8 B frozen params across GPUs.')
     parser.add_argument('--resume_from', type=str, default=None)
     parser.add_argument('--log_every', type=int, default=10, help='Log metrics every N steps')
     args = parser.parse_args()
@@ -474,14 +515,30 @@ def main():
     for param in model.parameters():
         param.requires_grad = True
 
+    if args.frozen_backbone:
+        # Freeze every parameter that is NOT part of the GRU memory or the
+        # auxiliary head.  The backbone will still run a forward pass (we need
+        # its features for the head), but its weights don't move.
+        # This is a SPEED/ABLATION mode — co-adaptation requires requires_grad=True
+        # on the backbone.
+        _head_keywords = ('memory_projections', 'inventory_embedding_head', 'initial_memory')
+        for n, p in model.named_parameters():
+            if not any(kw in n for kw in _head_keywords):
+                p.requires_grad = False
+        if rank == 0:
+            n_frozen    = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+            n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"  [frozen_backbone] {n_frozen:,} params frozen, {n_trainable:,} trainable")
+
     total_params = sum(p.numel() for p in model.parameters())
+    n_trainable  = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     if rank == 0:
-        print(f"  Total params: {total_params:,}  (all trainable)")
+        print(f"  Total params: {total_params:,}  (trainable: {n_trainable:,})")
 
     # FSDP setup
     model = model.to(device, dtype=torch.bfloat16)
-    model = get_fsdp_model(model, device_id=local_rank)
+    model = get_fsdp_model(model, device_id=local_rank, frozen_backbone=args.frozen_backbone)
 
     # Two param groups: head+memory at high LR, backbone at low LR.
     # With FSDP use_orig_params=True, original tensors are accessible via
@@ -495,6 +552,8 @@ def main():
     head_params_list = []
     backbone_params_list = []
     for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue   # frozen backbone — skip entirely; AdamW sees no gradient
         if n in head_param_names:
             head_params_list.append(p)
         else:
@@ -613,9 +672,21 @@ def main():
 
         scale = args.bptt_chunk_size * args.grad_accum_steps
 
-        # Build the chat template string once — text never changes between frames.
-        # Only pixel_values differs per frame, so we can reuse chat_text across
-        # the entire inner loop.
+        # ── Preprocessor optimisation ──────────────────────────────────────────
+        # Calling processor(text=..., images=[frame]) inside the per-frame loop
+        # runs BPE tokenisation + chat-template expansion + image preprocessing
+        # on every iteration.  The text never changes between frames, so we
+        # separate the two concerns:
+        #
+        #   1. Tokenise ONCE → static input_ids / attention_mask valid for all
+        #      frames (all frames are 224×224, so image_grid_thw is also constant).
+        #
+        #   2. Batch-preprocess all chunk frames in ONE image-processor call
+        #      instead of bptt_chunk_size individual calls, then split the packed
+        #      pixel_values tensor by image_grid_thw before the inner loop.
+        #
+        # This eliminates ~(bptt_chunk_size - 1) tokenisation calls and folds
+        # N image-processor calls into one batched call per outer step.
         _dummy_frame = seq['frames'][start_idx]
         chat_text = processor.apply_chat_template(
             [{"role": "user", "content": [
@@ -625,6 +696,29 @@ def main():
             tokenize=False, add_generation_prompt=True,
         )
 
+        # Static text inputs — identical for every frame in the chunk
+        _static = processor(text=chat_text, images=[_dummy_frame], return_tensors="pt")
+        _static_input_ids = _static['input_ids'].to(device)       # [1, seq_len]
+        _static_attn_mask = _static['attention_mask'].to(device)  # [1, seq_len]
+
+        # Batch pixel preprocessing for the entire BPTT chunk
+        _chunk_end    = min(start_idx + args.bptt_chunk_size, len(seq['frames']))
+        _chunk_frames = seq['frames'][start_idx:_chunk_end]
+        _batch_img    = processor.image_processor(images=_chunk_frames, return_tensors="pt")
+        _raw_pv       = _batch_img['pixel_values']           # [total_patches, …] packed
+        _thw          = _batch_img['image_grid_thw']         # [N, 3]  T×H×W per frame
+
+        # Split packed pixel_values into per-frame tensors using image_grid_thw
+        _pv_per_frame:  list = []
+        _thw_per_frame: list = []
+        _offset = 0
+        for _fi in range(len(_chunk_frames)):
+            _n = int(_thw[_fi, 0] * _thw[_fi, 1] * _thw[_fi, 2])
+            _pv_per_frame.append(_raw_pv[_offset:_offset + _n].to(device))
+            _thw_per_frame.append(_thw[_fi:_fi + 1].to(device))
+            _offset += _n
+        # ── End preprocessor optimisation ─────────────────────────────────────
+
         # True BPTT: accumulate loss across all frames in the window, then call
         # backward ONCE.  Memory is NOT detached between frames so gradients flow
         # back through the GRU recurrence.  This is what actually teaches the GRU
@@ -632,27 +726,24 @@ def main():
         # predict inventory correctly at frame 150."
         seq_loss = None   # tensor — accumulates the computation graph
 
-        for t in range(start_idx, min(start_idx + args.bptt_chunk_size, len(seq['frames']))):
-            frame = seq['frames'][t]
+        for t in range(start_idx, _chunk_end):
+            _t_rel = t - start_idx
             inv_type_target  = seq['inventory_embeddings'][t:t+1].to(device, dtype=torch.bfloat16)  # [1, 36, 768]
             inv_count_target = seq['inventory_counts'][t:t+1].to(device)      # [1, 36] long
 
-            inputs = processor(text=chat_text, images=[frame], return_tensors="pt")
-            inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-
             outputs = model(
-                input_ids=inputs.get('input_ids'),
-                pixel_values=inputs.get('pixel_values'),
-                image_grid_thw=inputs.get('image_grid_thw'),
+                input_ids=_static_input_ids,
+                pixel_values=_pv_per_frame[_t_rel],
+                image_grid_thw=_thw_per_frame[_t_rel],
                 prev_memory=memory,
-                attention_mask=inputs.get('attention_mask'),
+                attention_mask=_static_attn_mask,
                 labels=None,
             )
 
             # No detach — memory carries the gradient graph across frames.
             memory = outputs.new_memory
 
-            memory_reg = 0.01 * (memory ** 2).mean()
+            memory_reg = 0.1 * (memory ** 2).mean()
             frame_loss = memory_reg / scale
 
             if outputs.inventory_embedding is not None:
@@ -692,6 +783,13 @@ def main():
 
             seq_loss = frame_loss if seq_loss is None else seq_loss + frame_loss
             chunk_losses.append(frame_loss.item() * scale)  # display (forces CUDA sync)
+
+            # Hard norm cap: clamp memory to unit ball before next frame.
+            # When norm > 1.0 this renormalises to exactly 1.0; when norm ≤ 1.0
+            # it's a no-op.  Differentiable — gradient flows through the division.
+            # The soft memory_reg penalty (above) discourages growth; this hard
+            # cap is the safety net that prevents runaway explosion regardless.
+            memory = memory / memory.norm(dim=-1, keepdim=True).clamp(min=1.0)
 
         # Snapshot memory norm before backward frees the graph.
         memory_norm_end = memory.detach().float().norm().item()

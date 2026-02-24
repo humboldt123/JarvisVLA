@@ -259,32 +259,59 @@ class StatefulVLAInference:
     ) -> torch.Tensor:
         """
         Generate text with memory context.
-        
-        Projects memory and appends to inputs, then generates.
+
+        Matches the training layout exactly:
+            [memory_token] + [visual_patch_embeddings] + [text_embeddings]
+
+        Bugs fixed vs the original:
+          1. Memory was APPENDED at training but APPENDED here — now PREPENDED
+             to match StatefulJarvisVLA._build_inputs_with_memory.
+          2. pixel_values were never fed through the visual encoder — images
+             were silently dropped during generation.
+          3. Attention mask was extended by appending (wrong) — now prepended.
         """
         # Project memory to hidden dimension
         projected_memory = self.model.memory_projections.project_in(memory)
-        
-        # Get input embeddings
+
+        # Embed text tokens
         if hasattr(self.model.base_model, 'model') and hasattr(self.model.base_model.model, 'embed_tokens'):
-            text_embeds = self.model.base_model.model.embed_tokens(inputs['input_ids'])
+            embed_layer = self.model.base_model.model.embed_tokens
         else:
-            text_embeds = self.model.base_model.get_input_embeddings()(inputs['input_ids'])
-        
-        # Append memory token
-        memory_embeds = projected_memory.unsqueeze(1)  # [batch, 1, hidden]
-        inputs_embeds = torch.cat([text_embeds, memory_embeds], dim=1)
-        
-        # Extend attention mask for memory token
+            embed_layer = self.model.base_model.get_input_embeddings()
+
+        input_ids = inputs['input_ids'].to(embed_layer.weight.device)
+        text_embeds = embed_layer(input_ids)
+
+        # Replace image-placeholder positions with real patch embeddings,
+        # identical to what _build_inputs_with_memory does during training.
+        pixel_values = inputs.get('pixel_values')
+        image_grid_thw = inputs.get('image_grid_thw')
+        if pixel_values is not None:
+            pixel_values = pixel_values.to(
+                device=embed_layer.weight.device,
+                dtype=self.model.base_model.visual.get_dtype(),
+            )
+            image_embeds = self.model.base_model.visual(pixel_values, grid_thw=image_grid_thw)
+            image_mask = (input_ids == self.model.base_model.config.image_token_id)
+            text_embeds = text_embeds.clone()
+            text_embeds[image_mask] = image_embeds.to(text_embeds.dtype)
+
+        # PREPEND memory token — training layout: [memory, visual, text]
+        memory_embeds = projected_memory.to(
+            device=text_embeds.device, dtype=text_embeds.dtype
+        ).unsqueeze(1)                               # [batch, 1, hidden_dim]
+        inputs_embeds = torch.cat([memory_embeds, text_embeds], dim=1)
+
+        # PREPEND 1 to attention mask for the memory token (matches training)
         attention_mask = inputs.get('attention_mask')
         if attention_mask is not None:
             memory_mask = torch.ones(
                 attention_mask.shape[0], 1,
                 dtype=attention_mask.dtype,
-                device=attention_mask.device
+                device=attention_mask.device,
             )
-            attention_mask = torch.cat([attention_mask, memory_mask], dim=1)
-        
+            attention_mask = torch.cat([memory_mask, attention_mask], dim=1)
+
         # Generate
         outputs = self.model.base_model.generate(
             inputs_embeds=inputs_embeds,
@@ -294,7 +321,7 @@ class StatefulVLAInference:
             do_sample=do_sample,
             use_cache=True,
         )
-        
+
         return outputs
     
     @torch.no_grad()
@@ -309,9 +336,16 @@ class StatefulVLAInference:
     ) -> str:
         """
         Generate a response with stateful context.
-        
+
         This is the main inference interface.
-        
+
+        Fix vs original:
+          The original ran TWO forward passes: one for generation (with stale
+          memory) and one to update memory (result ignored for the generation
+          that already happened).  Now: one forward pass updates the memory
+          from the current observation, then generation uses the updated state.
+          This matches the step() method and the training-time semantics.
+
         Args:
             image: PIL Image
             text: Text prompt
@@ -319,27 +353,32 @@ class StatefulVLAInference:
             temperature: Sampling temperature
             do_sample: Whether to sample
             reset_state: Whether to reset memory before generation
-        
+
         Returns:
             generated_text: The generated response
         """
         if reset_state:
             self.reset_state(batch_size=1)
-        
-        # Process inputs
-        inputs = self.processor(
-            text=text,
-            images=image,
-            return_tensors="pt",
-        )
-        inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+
+        inputs = self.processor(text=text, images=image, return_tensors="pt")
+        inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                   for k, v in inputs.items()}
-        
-        # Use memory if available
+
         if self.current_memory is None:
             self.reset_state(batch_size=1)
-        
-        # Generate with memory
+
+        # Single forward pass: observe the current frame, update memory.
+        # Generation then uses the freshly-updated state (same as step()).
+        fwd = self.model(
+            input_ids=inputs.get('input_ids'),
+            pixel_values=inputs.get('pixel_values'),
+            image_grid_thw=inputs.get('image_grid_thw'),
+            prev_memory=self.current_memory,
+            attention_mask=inputs.get('attention_mask'),
+        )
+        self.current_memory = fwd.new_memory
+
+        # Generate text conditioned on the updated memory
         generated_ids = self._generate_with_memory(
             inputs=inputs,
             memory=self.current_memory,
@@ -347,24 +386,11 @@ class StatefulVLAInference:
             temperature=temperature,
             do_sample=do_sample,
         )
-        
-        # Update memory state
-        # We need to run a forward pass to get the updated memory
-        with torch.enable_grad() if self.model.training else torch.no_grad():
-            outputs = self.model(
-                input_ids=inputs['input_ids'],
-                pixel_values=inputs.get('pixel_values'),
-                image_grid_thw=inputs.get('image_grid_thw'),
-                prev_memory=self.current_memory,
-            )
-            self.current_memory = outputs.new_memory
-        
-        # Decode
+
         generated_text = self.processor.tokenizer.decode(
             generated_ids[0],
             skip_special_tokens=True,
         )
-        
         return generated_text
 
 

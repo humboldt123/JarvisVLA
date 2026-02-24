@@ -79,7 +79,7 @@ def create_plot(metrics, output_file):
     update_gn_s  = [m['step']              for m in metrics if m.get('is_update_step') and m.get('grad_norm', 0) > 0]
     update_hgn   = [m['inv_head_grad_norm'] for m in metrics if m.get('is_update_step')]
 
-    fig, axes = plt.subplots(4, 2, figsize=(16, 20))
+    fig, axes = plt.subplots(5, 2, figsize=(16, 25))
     fig.suptitle('JarvisVLA — Inventory Memory Training', fontsize=14, fontweight='bold')
 
     # ── Row 0: Type loss  |  GUI vs Closed cos_sim (THE key diagnostic) ──────
@@ -153,6 +153,57 @@ def create_plot(metrics, output_file):
 
     plot_series(axes[3,1], steps, step_times, 'step time', 'gray',
                 'Step Time per Outer Step', 'Seconds')
+
+    # ── Row 4: Memory retention scatter  |  GUI−Closed gap over time ────────
+    #
+    # Scatter (left): each point is (cos_sim_gui_t, cos_sim_closed_t) coloured
+    # by training step (blue=early, red=late).  As co-adaptation improves the
+    # GRU memory, points should drift toward the y=x diagonal — meaning the
+    # model predicts inventory equally well whether or not the screen is open.
+    #
+    # Gap (right): (cos_sim_gui − cos_sim_closed) over steps.  Should trend
+    # toward 0.  Flat or growing gap means memory isn't improving.
+    #
+    # Label: "Memory retention: gap between GUI-open and GUI-closed cos_sim
+    #          should close over training."
+    ax = axes[4, 0]
+    valid_pts = [
+        (steps[i], cos_gui[i], cos_closed[i])
+        for i in range(len(steps))
+        if (cos_gui[i] not in (None, 0.0) and cos_closed[i] not in (None, 0.0)
+            and not math.isnan(cos_gui[i]) and not math.isnan(cos_closed[i]))
+    ]
+    if valid_pts:
+        sc_steps, sc_g, sc_c = zip(*valid_pts)
+        sc = ax.scatter(sc_g, sc_c, c=sc_steps, cmap='coolwarm', s=6, alpha=0.55, zorder=3)
+        plt.colorbar(sc, ax=ax, label='Step')
+        _lo = min(min(sc_g), min(sc_c))
+        _hi = max(max(sc_g), max(sc_c))
+        ax.plot([_lo, _hi], [_lo, _hi], 'k--', alpha=0.35, linewidth=1.2, label='y=x  (no gap)')
+    ax.set_xlabel('cos_sim GUI-open (visual read)')
+    ax.set_ylabel('cos_sim GUI-closed (memory retention)')
+    ax.set_title('Memory retention: gap between GUI-open and GUI-closed cos_sim\n'
+                 'should close over training  (blue=early steps, red=late steps)')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[4, 1]
+    gap = [
+        (cos_gui[i] - cos_closed[i])
+        if (cos_gui[i] not in (None, 0.0) and cos_closed[i] not in (None, 0.0)
+            and not math.isnan(float(cos_gui[i])) and not math.isnan(float(cos_closed[i])))
+        else float('nan')
+        for i in range(len(steps))
+    ]
+    ax.plot(steps, gap, alpha=0.2, color='coral', linewidth=0.6)
+    ax.plot(steps, smooth(gap), color='coral', linewidth=2, label='gui − closed gap')
+    ax.axhline(y=0, linestyle=':', color='black', alpha=0.4)
+    ax.set_xlabel('Step')
+    ax.set_ylabel('cos_sim_gui − cos_sim_closed')
+    ax.set_title('GUI/Closed gap over training\n'
+                 'Should trend → 0  as GRU learns to retain inventory')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
