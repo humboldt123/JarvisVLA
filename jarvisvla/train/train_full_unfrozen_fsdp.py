@@ -37,6 +37,7 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLDecoderLayer
 
 sys.path.insert(0, '/home/vvm33/JarvisVLA')
 from jarvisvla.models.stateful_vla import wrap_model_for_stateful_training
+from jarvisvla.train.mc_item_vocab import get_item_vocab_size, COUNT_CLASSES, item_id_to_name
 
 
 # ---------------------------------------------------------------------------
@@ -234,13 +235,12 @@ def evaluate_on_test_set(model, test_loader, processor, args, device, rank, logg
     if model.inventory_embedding_head is not None:
         model.inventory_embedding_head.eval()   # keep dropout off
 
-    total_cos = 0.0
-    non_empty_cos = 0.0
-    total_count_mae = 0.0
-    n_total = 0
+    total_item_acc  = 0.0
+    ne_item_acc     = 0.0
+    total_count_acc = 0.0
+    n_total     = 0
     n_non_empty = 0
-    n_count = 0
-    vocab_set: set = set()
+    n_count     = 0
     display_examples: List[Dict] = []
 
     with torch.no_grad():
@@ -251,10 +251,8 @@ def evaluate_on_test_set(model, test_loader, processor, args, device, rank, logg
             seq = test_loader[seq_idx]
             memory = torch.zeros(1, args.memory_dim, device=device, dtype=torch.bfloat16)
 
-            # Tokenise once per sequence — text is constant, only pixel_values
-            # differ per frame.  Same optimisation as the training inner loop.
-            _ref_frame   = seq['frames'][0]
-            _eval_chat   = processor.apply_chat_template(
+            _ref_frame  = seq['frames'][0]
+            _eval_chat  = processor.apply_chat_template(
                 [{"role": "user", "content": [
                     {"type": "image", "image": _ref_frame},
                     {"type": "text", "text": "What is in the inventory?"},
@@ -267,14 +265,13 @@ def evaluate_on_test_set(model, test_loader, processor, args, device, rank, logg
 
             for t in range(len(seq['frames'])):
                 frame            = seq['frames'][t]
-                inv_type_target  = seq['inventory_embeddings'][t:t+1].to(device, dtype=torch.bfloat16)  # [1,36,768]
-                inv_count_target = seq['inventory_counts'][t:t+1].to(device)      # [1,36] long
+                inv_id_target    = seq['inventory_ids'][t:t+1].to(device)      # [1, 36] long
+                inv_count_target = seq['inventory_counts'][t:t+1].to(device)   # [1, 36] long
                 is_non_empty     = seq['inventory_has_items'][t]
                 slot_type_texts  = seq.get('inventory_slot_texts',
                                            [['empty slot']*36]*len(seq['frames']))[t]
                 slot_counts      = seq['inventory_counts'][t]  # [36] long, cpu
 
-                # Per-frame: only pixel values need reprocessing
                 _img_out = processor.image_processor(images=[frame], return_tensors="pt")
                 _pv      = _img_out['pixel_values'].to(device)
                 _thw     = _img_out['image_grid_thw'].to(device) if 'image_grid_thw' in _img_out else None
@@ -288,61 +285,56 @@ def evaluate_on_test_set(model, test_loader, processor, args, device, rank, logg
                     labels=None,
                 )
 
-                if outputs.inventory_embedding is not None:
-                    pred_type  = outputs.inventory_embedding[0]  # [36, 768]
-                    pred_count = outputs.inventory_count[0]       # [36] log(count+1) preds
-                    tgt_type   = inv_type_target[0]               # [36, 768]
-                    tgt_count  = inv_count_target[0].float()      # [36]
+                if outputs.item_logits is not None:
+                    item_logits  = outputs.item_logits[0]   # [36, item_vocab_size]
+                    count_logits = outputs.count_logits[0]  # [36, count_classes]
+                    tgt_ids      = inv_id_target[0]         # [36] long
+                    tgt_counts   = inv_count_target[0]      # [36] long
 
-                    per_slot_cos = (pred_type * tgt_type).sum(dim=-1)
-                    cos_sim = per_slot_cos.mean().item()
-                    total_cos += cos_sim
+                    pred_ids    = item_logits.argmax(dim=-1)   # [36]
+                    pred_counts = count_logits.argmax(dim=-1)  # [36]
+
+                    # Top-1 accuracy over all 36 slots
+                    acc_all = (pred_ids == tgt_ids).float().mean().item()
+                    total_item_acc += acc_all
                     n_total += 1
 
                     if is_non_empty:
-                        non_empty_cos += cos_sim
+                        ne_item_acc += acc_all
                         n_non_empty += 1
-                        non_empty_mask = tgt_count > 0
+                        non_empty_mask = tgt_ids > 0
                         if non_empty_mask.any():
-                            pred_cnt_exp = (torch.exp(pred_count[non_empty_mask]) - 1).clamp(min=0)
-                            mae = (pred_cnt_exp - tgt_count[non_empty_mask]).abs().mean().item()
-                            total_count_mae += mae
+                            cnt_acc = (pred_counts[non_empty_mask] ==
+                                       tgt_counts[non_empty_mask]).float().mean().item()
+                            total_count_acc += cnt_acc
                             n_count += 1
 
-                    if rank == 0:
-                        for txt in slot_type_texts:
-                            if txt != "empty slot":
-                                vocab_set.add(txt)
-
-                        if is_non_empty and len(display_examples) < 3:
-                            display_examples.append({
-                                'source': seq.get('source_file', '?'),
-                                'tick': t,
-                                'mean_cos': cos_sim,
-                                # (slot_idx, type_text, true_count, pred_type_emb,
-                                #  pred_log_count, per_slot_cos)
-                                'slots': [
-                                    (i, slot_type_texts[i],
-                                     int(slot_counts[i].item()),
-                                     pred_type[i].float().cpu(),
-                                     pred_count[i].float().item(),
-                                     per_slot_cos[i].item())
-                                    for i in range(len(slot_type_texts))
-                                    if slot_type_texts[i] != "empty slot"
-                                ],
-                            })
+                    if rank == 0 and is_non_empty and len(display_examples) < 3:
+                        display_examples.append({
+                            'source': seq.get('source_file', '?'),
+                            'tick': t,
+                            'item_acc': acc_all,
+                            'slots': [
+                                (i, slot_type_texts[i],
+                                 int(slot_counts[i].item()),
+                                 int(pred_ids[i].item()),
+                                 int(pred_counts[i].item()))
+                                for i in range(len(slot_type_texts))
+                                if slot_type_texts[i] != "empty slot"
+                            ],
+                        })
 
                 memory = outputs.new_memory.detach()
 
-    avg_cos       = total_cos       / max(n_total,     1)
-    avg_ne_cos    = non_empty_cos   / max(n_non_empty, 1)
-    avg_count_mae = total_count_mae / max(n_count,     1)
-    non_empty_pct = 100.0 * n_non_empty / max(n_total, 1)
+    avg_item_acc   = total_item_acc  / max(n_total,     1)
+    avg_ne_acc     = ne_item_acc     / max(n_non_empty, 1)
+    avg_count_acc  = total_count_acc / max(n_count,     1)
+    non_empty_pct  = 100.0 * n_non_empty / max(n_total, 1)
 
     eval_metrics = {
-        'eval_cos_sim':           avg_cos,
-        'eval_non_empty_cos_sim': avg_ne_cos,
-        'eval_count_mae':         avg_count_mae,
+        'eval_item_acc':          avg_item_acc,
+        'eval_non_empty_item_acc': avg_ne_acc,
+        'eval_count_acc':         avg_count_acc,
         'eval_non_empty_pct':     non_empty_pct,
         'eval_n_frames':          n_total,
         'eval_seqs':              num_seqs,
@@ -353,39 +345,28 @@ def evaluate_on_test_set(model, test_loader, processor, args, device, rank, logg
         print(f"\n{'='*70}")
         print(f"TEST SET EVALUATION  ({num_seqs} seqs, {n_total} frames)")
         print(f"{'='*70}")
-        print(f"  Type cos-sim (all frames)  : {avg_cos:.4f}")
-        print(f"  Type cos-sim (non-empty)   : {avg_ne_cos:.4f}"
+        print(f"  Item top-1 acc (all frames): {avg_item_acc:.4f}")
+        print(f"  Item top-1 acc (non-empty) : {avg_ne_acc:.4f}"
               f"  ({n_non_empty}/{n_total} = {non_empty_pct:.1f}%)")
-        print(f"  Count MAE  (non-empty slots): {avg_count_mae:.2f} items")
+        print(f"  Count top-1 acc (non-empty): {avg_count_acc:.4f}")
 
-        if display_examples and vocab_set:
-            enc = test_loader.encoder
-            vocab_list = sorted(vocab_set)
-            # Trigram encoder: embed each item name directly (no tokenizer/model attrs)
-            vocab_embs_cpu = torch.stack([
-                torch.from_numpy(enc._name_to_embedding(name)) for name in vocab_list
-            ])  # [vocab_size, 768], already L2-normalised
-
-            print(f"\n--- Inventory head predictions (NN-decoded, non-empty frames) ---")
+        if display_examples:
+            print(f"\n--- Inventory head predictions (non-empty frames) ---")
             for ex in display_examples:
-                gt_items   = {txt for _, txt, _, _, _, _ in ex['slots']}
+                gt_items   = {txt for _, txt, _, _, _ in ex['slots']}
                 pred_items: set = set()
 
-                print(f"\n  [{ex['source']}  tick {ex['tick']}]  type cos={ex['mean_cos']:.3f}")
-                for slot_idx, type_text, true_cnt, pred_emb, pred_log_cnt, cs in ex['slots']:
-                    pred_cnt = max(0, round(math.exp(pred_log_cnt) - 1))
-                    sims = (pred_emb.unsqueeze(0) @ vocab_embs_cpu.T).squeeze(0)
-                    pred_type = vocab_list[sims.argmax().item()]
+                print(f"\n  [{ex['source']}  tick {ex['tick']}]  item_acc={ex['item_acc']:.3f}")
+                for slot_idx, type_text, true_cnt, pred_item_id, pred_cnt_class in ex['slots']:
+                    pred_type = item_id_to_name(pred_item_id)
                     pred_items.add(pred_type)
                     match = '✓' if pred_type == type_text else '✗'
-                    bar = '█' * int(cs * 20) + '░' * (20 - int(cs * 20))
                     print(f"    slot {slot_idx:>2}"
-                          f"  GT: {type_text:<20} cnt:{true_cnt:<4}"
-                          f"PRED: {pred_type:<20} cnt:{pred_cnt:<4}"
-                          f"  {bar} {cs:.3f} {match}")
+                          f"  GT: {type_text:<22} cnt:{true_cnt:<4}"
+                          f"PRED: {pred_type:<22} cnt:{pred_cnt_class:<4}  {match}")
 
                 if gt_items or pred_items:
-                    jaccard = len(gt_items & pred_items) / len(gt_items | pred_items)
+                    jaccard = len(gt_items & pred_items) / max(len(gt_items | pred_items), 1)
                     print(f"           Jaccard (types): {jaccard:.2f}"
                           f"  GT={sorted(gt_items)}  PRED={sorted(pred_items)}")
 
@@ -506,7 +487,7 @@ def main():
         base_model=base_model,
         memory_dim=args.memory_dim,
         add_inventory_head=True,
-        inventory_head_kwargs={'output_dim': 768},
+        inventory_head_kwargs={},   # uses defaults: item_vocab_size from mc-data, 128 count classes
     )
 
     # All params trainable — backbone at low LR, head+mem at high LR.
@@ -635,12 +616,15 @@ def main():
         model.train()
         model.train_aux_heads(True)  # Enable inventory head
         chunk_losses = []
-        chunk_type_losses = []
+        chunk_type_losses = []     # item CE loss (logged as "type_loss" for plot compat)
         chunk_count_losses = []
-        chunk_n_ne = []              # non-empty slot counts per frame
-        chunk_type_losses_gui    = []   # type loss on frames where inventory screen is open
-        chunk_type_losses_closed = []   # type loss on frames where inventory screen is closed
-        chunk_n_gui = 0              # how many frames had the GUI open this step
+        chunk_n_ne = []            # non-empty slot counts per frame
+        chunk_type_losses_gui    = []   # item loss on GUI-open frames
+        chunk_type_losses_closed = []   # item loss on GUI-closed frames
+        chunk_acc_all:    List[float] = []
+        chunk_acc_gui:    List[float] = []
+        chunk_acc_closed: List[float] = []
+        chunk_n_gui = 0            # how many frames had the GUI open this step
 
         memory = torch.zeros(1, args.memory_dim, device=device, dtype=torch.bfloat16)
 
@@ -728,8 +712,8 @@ def main():
 
         for t in range(start_idx, _chunk_end):
             _t_rel = t - start_idx
-            inv_type_target  = seq['inventory_embeddings'][t:t+1].to(device, dtype=torch.bfloat16)  # [1, 36, 768]
-            inv_count_target = seq['inventory_counts'][t:t+1].to(device)      # [1, 36] long
+            inv_id_target    = seq['inventory_ids'][t:t+1].to(device)       # [1, 36] long
+            inv_count_target = seq['inventory_counts'][t:t+1].to(device)    # [1, 36] long
 
             outputs = model(
                 input_ids=_static_input_ids,
@@ -746,37 +730,47 @@ def main():
             memory_reg = 0.1 * (memory ** 2).mean()
             frame_loss = memory_reg / scale
 
-            if outputs.inventory_embedding is not None:
-                pred_type  = outputs.inventory_embedding[0]   # [36, 768]
-                pred_count = outputs.inventory_count[0]        # [36]
-                tgt_type   = inv_type_target[0]                # [36, 768]
-                tgt_count  = inv_count_target[0].float()       # [36]
+            if outputs.item_logits is not None:
+                item_logits  = outputs.item_logits[0]    # [36, item_vocab_size]
+                count_logits = outputs.count_logits[0]   # [36, count_classes]
+                tgt_ids      = inv_id_target[0]          # [36] long
+                tgt_counts   = inv_count_target[0]       # [36] long
 
-                non_empty = tgt_count > 0                      # [36] bool mask
+                non_empty = tgt_ids > 0                  # [36] bool mask (0 = empty)
                 N_ne = int(non_empty.sum().item())
                 chunk_n_ne.append(N_ne)
 
-                # --- Type loss: per-slot -log((1+cos_sim)/2) over ALL 36 slots ---
-                cos_sim_all = (pred_type * tgt_type).sum(dim=-1)   # [36]
-                type_loss = -torch.log((1.0 + cos_sim_all) / 2.0 + 1e-8).mean()
+                # --- Item type loss: CE over all 36 slots ---
+                # Empty slots (target=0) provide supervision to predict "empty";
+                # non-empty slots must predict the correct item ID.
+                item_loss = F.cross_entropy(item_logits, tgt_ids)
 
-                # --- Count loss: MSE on log(count+1) for non-empty slots ---
+                # --- Count loss: CE over non-empty slots only ---
                 count_loss = None
                 if N_ne > 0:
-                    count_loss = F.mse_loss(
-                        pred_count[non_empty],
-                        torch.log(tgt_count[non_empty] + 1).to(pred_count.dtype),
+                    count_loss = F.cross_entropy(
+                        count_logits[non_empty],
+                        tgt_counts[non_empty],
                     )
 
-                frame_loss = frame_loss + args.inventory_weight * type_loss / scale
-                tl_val = type_loss.item()
+                frame_loss = frame_loss + args.inventory_weight * item_loss / scale
+                tl_val = item_loss.item()
                 chunk_type_losses.append(tl_val)
                 is_gui_t = seq['is_gui_inventory'][t]
-                if is_gui_t:
-                    chunk_type_losses_gui.append(tl_val)
-                    chunk_n_gui += 1
-                else:
-                    chunk_type_losses_closed.append(tl_val)
+
+                # Top-1 accuracy for training-step monitoring (no extra backward)
+                with torch.no_grad():
+                    pred_ids    = item_logits.argmax(dim=-1)   # [36]
+                    pred_counts = count_logits.argmax(dim=-1)  # [36]
+                    acc_t = (pred_ids == tgt_ids).float().mean().item()
+                    chunk_acc_all.append(acc_t)
+                    if is_gui_t:
+                        chunk_type_losses_gui.append(tl_val)
+                        chunk_acc_gui.append(acc_t)
+                        chunk_n_gui += 1
+                    else:
+                        chunk_type_losses_closed.append(tl_val)
+                        chunk_acc_closed.append(acc_t)
                 if count_loss is not None:
                     frame_loss = frame_loss + args.count_weight * count_loss / scale
                     chunk_count_losses.append(count_loss.item())
@@ -870,28 +864,28 @@ def main():
             avg_type_loss  = sum(chunk_type_losses)  / len(chunk_type_losses)  if chunk_type_losses  else 0.0
             avg_count_loss = sum(chunk_count_losses) / len(chunk_count_losses) if chunk_count_losses else 0.0
             avg_n_ne       = sum(chunk_n_ne)         / len(chunk_n_ne)         if chunk_n_ne         else 0.0
-            # GUI vs closed type-loss → cos_sim.  The KEY diagnostic:
-            # closed-frame cos_sim should improve over training even though the
-            # model cannot see the inventory screen (must rely on memory).
-            _tl_gui    = sum(chunk_type_losses_gui)    / len(chunk_type_losses_gui)    if chunk_type_losses_gui    else None
-            _tl_closed = sum(chunk_type_losses_closed) / len(chunk_type_losses_closed) if chunk_type_losses_closed else None
-            cos_gui    = 2.0 * math.exp(-_tl_gui)    - 1.0 if _tl_gui    is not None else None
-            cos_closed = 2.0 * math.exp(-_tl_closed) - 1.0 if _tl_closed is not None else None
+            # GUI vs closed item accuracy — THE key diagnostic.
+            # closed-frame accuracy should rise over training as the model
+            # learns to retain inventory state through the GRU memory.
+            acc_gui    = sum(chunk_acc_gui)    / len(chunk_acc_gui)    if chunk_acc_gui    else None
+            acc_closed = sum(chunk_acc_closed) / len(chunk_acc_closed) if chunk_acc_closed else None
+            acc_all_avg= sum(chunk_acc_all)    / len(chunk_acc_all)    if chunk_acc_all    else None
 
             step_time = time.time() - step_start
             step_times.append(step_time)
 
             metrics = {
                 'loss':               avg_loss,
-                'type_loss':          avg_type_loss,
+                'type_loss':          avg_type_loss,   # item CE loss (named type_loss for plot compat)
                 'count_loss':         avg_count_loss,
                 'n_ne_avg':           avg_n_ne,
                 'n_gui_frames':       chunk_n_gui,
-                # cos_sim_gui:   how well the model reads inventory from the visual
-                # cos_sim_closed: how well memory retains inventory when screen is closed
-                # The gap between these should CLOSE over training as memory improves.
-                'cos_sim_gui':        cos_gui    if cos_gui    is not None else 0.0,
-                'cos_sim_closed':     cos_closed if cos_closed is not None else 0.0,
+                # acc_gui:   item top-1 accuracy on GUI-open frames (direct visual read)
+                # acc_closed: item top-1 accuracy on GUI-closed frames (memory retention)
+                # Gap should CLOSE over training as GRU learns to retain inventory.
+                'cos_sim_gui':        acc_gui    if acc_gui    is not None else 0.0,  # name kept for plot compat
+                'cos_sim_closed':     acc_closed if acc_closed is not None else 0.0,  # name kept for plot compat
+                'item_acc_all':       acc_all_avg if acc_all_avg is not None else 0.0,
                 'memory_norm':        memory_norm_end,
                 'grad_norm':          last_gn or 0.0,
                 'inv_head_grad_norm': inv_head_grad_norm or 0.0,
@@ -909,11 +903,10 @@ def main():
                 # Use smoothed (update-window averaged) values for display
                 disp_type  = last_avg_type  if last_avg_type  is not None else avg_type_loss
                 disp_count = last_avg_count if last_avg_count is not None else avg_count_loss
-                cos_display  = 2.0 * math.exp(-disp_type) - 1.0
-                gui_str    = f"{cos_gui:+.3f}"    if cos_gui    is not None else "  N/A"
-                closed_str = f"{cos_closed:+.3f}" if cos_closed is not None else "  N/A"
+                gui_str    = f"{acc_gui:.3f}"    if acc_gui    is not None else "  N/A"
+                closed_str = f"{acc_closed:.3f}" if acc_closed is not None else "  N/A"
                 flag = "  *** NO GUI ***" if chunk_n_gui == 0 else ""
-                print(f"{step:>8} cos={cos_display:+.3f}(gui={gui_str} cls={closed_str})"
+                print(f"{step:>8} item_loss={disp_type:.3f} acc(gui={gui_str} cls={closed_str})"
                       f"  cnt={disp_count:.4f}  N_ne={avg_n_ne:4.1f} gui={chunk_n_gui:3d}"
                       f"  gN={gn_str} hGN={hgn_str} wN={wn_str} mN={memory_norm_end:.2f}"
                       f"  {step_time:>6.1f}s{flag}")
@@ -947,9 +940,9 @@ def main():
         print(f"\nMetrics saved to: {metrics_file}")
         print(f"Plot with: python jarvisvla/train/plot_metrics.py {metrics_file}")
         if eval_metrics:
-            print(f"  Eval type cos-sim (all):     {eval_metrics['eval_cos_sim']:.4f}")
-            print(f"  Eval type cos-sim (non-empty): {eval_metrics['eval_non_empty_cos_sim']:.4f}")
-            print(f"  Eval count MAE:              {eval_metrics['eval_count_mae']:.2f}")
+            print(f"  Eval item top-1 acc (all)  : {eval_metrics['eval_item_acc']:.4f}")
+            print(f"  Eval item top-1 acc (ne)   : {eval_metrics['eval_non_empty_item_acc']:.4f}")
+            print(f"  Eval count top-1 acc (ne)  : {eval_metrics['eval_count_acc']:.4f}")
     
     cleanup_distributed()
 

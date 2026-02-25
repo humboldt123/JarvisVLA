@@ -5,6 +5,8 @@ Plot training metrics from JSON Lines log file.
 Usage:
     python jarvisvla/train/plot_metrics.py /data/vvm33/checkpoints/train_inv_head/metrics.jsonl
     python jarvisvla/train/plot_metrics.py metrics.jsonl -o training_plot.png
+
+Supports both old (cosine-similarity) and new (cross-entropy / accuracy) metric logs.
 """
 
 import json
@@ -68,11 +70,18 @@ def create_plot(metrics, output_file):
     step_times = [m.get('step_time', 0)      for m in metrics]
     mem_norms  = [m.get('memory_norm', 0)    for m in metrics]
 
-    # cos_sim: recovered from type_loss, or stored directly
-    cos_all    = [2.0 * math.exp(-m['type_loss']) - 1.0
-                  if m.get('type_loss') else None for m in metrics]
-    cos_gui    = [m.get('cos_sim_gui')    for m in metrics]
-    cos_closed = [m.get('cos_sim_closed') for m in metrics]
+    # cos_sim_gui / cos_sim_closed now stores item accuracy (renamed field kept same
+    # for backward compat with old log files).  Detect which era the log is from.
+    acc_gui    = [m.get('cos_sim_gui')    for m in metrics]
+    acc_closed = [m.get('cos_sim_closed') for m in metrics]
+    acc_all    = [m.get('item_acc_all')   for m in metrics]
+
+    # Detect old-style logs (cosine similarity ≤ 1 but can be negative; accuracy 0-1 only)
+    # New logs: values are item top-1 accuracy in [0, 1]
+    # Old logs: values are cosine similarities also in [-1, 1] but semantically different.
+    # We just plot whatever is there under the right axis label.
+    is_new_style = any(m.get('item_acc_all') is not None for m in metrics)
+    y_label = 'Item Top-1 Accuracy' if is_new_style else 'cos_sim / Accuracy'
 
     update_steps = [m['step'] for m in metrics if m.get('is_update_step')]
     update_gn    = [m['grad_norm']          for m in metrics if m.get('is_update_step') and m.get('grad_norm', 0) > 0]
@@ -80,33 +89,33 @@ def create_plot(metrics, output_file):
     update_hgn   = [m['inv_head_grad_norm'] for m in metrics if m.get('is_update_step')]
 
     fig, axes = plt.subplots(5, 2, figsize=(16, 25))
-    fig.suptitle('JarvisVLA — Inventory Memory Training', fontsize=14, fontweight='bold')
+    fig.suptitle('JarvisVLA — Inventory Memory Training (discrete classification)', fontsize=14, fontweight='bold')
 
-    # ── Row 0: Type loss  |  GUI vs Closed cos_sim (THE key diagnostic) ──────
-    plot_series(axes[0,0], steps, type_losses, 'type loss', 'darkorchid',
-                'Type Loss  (-log cosine, all 36 slots)', 'Loss')
+    # ── Row 0: Item CE loss  |  GUI vs Closed accuracy (THE key diagnostic) ──
+    plot_series(axes[0,0], steps, type_losses, 'item CE loss', 'darkorchid',
+                'Item Type Loss  (cross-entropy, all 36 slots)', 'CE Loss')
 
     ax = axes[0,1]
-    cos_all_v    = [v if v is not None else float('nan') for v in cos_all]
-    cos_gui_v    = [v if v is not None else float('nan') for v in cos_gui]
-    cos_closed_v = [v if v is not None else float('nan') for v in cos_closed]
-    ax.plot(steps, cos_all_v,    alpha=0.15, color='gray',        linewidth=0.5)
-    ax.plot(steps, smooth(cos_all_v),    color='gray',        linewidth=1.5, label='cos_sim (all)',    linestyle='--')
-    ax.plot(steps, cos_gui_v,    alpha=0.15, color='steelblue',   linewidth=0.5)
-    ax.plot(steps, smooth(cos_gui_v),    color='steelblue',   linewidth=2,   label='cos_sim GUI open')
-    ax.plot(steps, cos_closed_v, alpha=0.15, color='tomato',      linewidth=0.5)
-    ax.plot(steps, smooth(cos_closed_v), color='tomato',      linewidth=2,   label='cos_sim GUI closed (memory)')
+    acc_all_v    = [v if v is not None else float('nan') for v in acc_all]
+    acc_gui_v    = [v if v is not None else float('nan') for v in acc_gui]
+    acc_closed_v = [v if v is not None else float('nan') for v in acc_closed]
+    ax.plot(steps, acc_all_v,    alpha=0.15, color='gray',        linewidth=0.5)
+    ax.plot(steps, smooth(acc_all_v),    color='gray',        linewidth=1.5, label='acc (all)',    linestyle='--')
+    ax.plot(steps, acc_gui_v,    alpha=0.15, color='steelblue',   linewidth=0.5)
+    ax.plot(steps, smooth(acc_gui_v),    color='steelblue',   linewidth=2,   label='acc GUI open')
+    ax.plot(steps, acc_closed_v, alpha=0.15, color='tomato',      linewidth=0.5)
+    ax.plot(steps, smooth(acc_closed_v), color='tomato',      linewidth=2,   label='acc GUI closed (memory)')
     ax.axhline(y=0, linestyle=':', color='black', alpha=0.3)
     ax.set_xlabel('Step')
-    ax.set_ylabel('cos_sim')
-    ax.set_title('GUI-open vs Closed cos_sim\n'
+    ax.set_ylabel(y_label)
+    ax.set_title('GUI-open vs Closed Item Accuracy\n'
                  'KEY: closed (red) should rise as memory learns to retain inventory')
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # ── Row 1: Count loss  |  Global grad norm ───────────────────────────────
-    plot_series(axes[1,0], steps, cnt_losses, 'count loss', 'seagreen',
-                'Count Loss  (log-MSE, non-empty slots only)', 'Loss')
+    # ── Row 1: Count CE loss  |  Global grad norm ────────────────────────────
+    plot_series(axes[1,0], steps, cnt_losses, 'count CE loss', 'seagreen',
+                'Count Loss  (cross-entropy, non-empty slots only)', 'CE Loss')
 
     ax = axes[1,1]
     if update_gn_s:
@@ -155,23 +164,12 @@ def create_plot(metrics, output_file):
                 'Step Time per Outer Step', 'Seconds')
 
     # ── Row 4: Memory retention scatter  |  GUI−Closed gap over time ────────
-    #
-    # Scatter (left): each point is (cos_sim_gui_t, cos_sim_closed_t) coloured
-    # by training step (blue=early, red=late).  As co-adaptation improves the
-    # GRU memory, points should drift toward the y=x diagonal — meaning the
-    # model predicts inventory equally well whether or not the screen is open.
-    #
-    # Gap (right): (cos_sim_gui − cos_sim_closed) over steps.  Should trend
-    # toward 0.  Flat or growing gap means memory isn't improving.
-    #
-    # Label: "Memory retention: gap between GUI-open and GUI-closed cos_sim
-    #          should close over training."
     ax = axes[4, 0]
     valid_pts = [
-        (steps[i], cos_gui[i], cos_closed[i])
+        (steps[i], acc_gui[i], acc_closed[i])
         for i in range(len(steps))
-        if (cos_gui[i] not in (None, 0.0) and cos_closed[i] not in (None, 0.0)
-            and not math.isnan(cos_gui[i]) and not math.isnan(cos_closed[i]))
+        if (acc_gui[i] not in (None, 0.0) and acc_closed[i] not in (None, 0.0)
+            and not math.isnan(float(acc_gui[i])) and not math.isnan(float(acc_closed[i])))
     ]
     if valid_pts:
         sc_steps, sc_g, sc_c = zip(*valid_pts)
@@ -180,18 +178,18 @@ def create_plot(metrics, output_file):
         _lo = min(min(sc_g), min(sc_c))
         _hi = max(max(sc_g), max(sc_c))
         ax.plot([_lo, _hi], [_lo, _hi], 'k--', alpha=0.35, linewidth=1.2, label='y=x  (no gap)')
-    ax.set_xlabel('cos_sim GUI-open (visual read)')
-    ax.set_ylabel('cos_sim GUI-closed (memory retention)')
-    ax.set_title('Memory retention: gap between GUI-open and GUI-closed cos_sim\n'
+    ax.set_xlabel('Accuracy GUI-open (visual read)')
+    ax.set_ylabel('Accuracy GUI-closed (memory retention)')
+    ax.set_title('Memory retention: GUI-open vs GUI-closed accuracy\n'
                  'should close over training  (blue=early steps, red=late steps)')
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
     ax = axes[4, 1]
     gap = [
-        (cos_gui[i] - cos_closed[i])
-        if (cos_gui[i] not in (None, 0.0) and cos_closed[i] not in (None, 0.0)
-            and not math.isnan(float(cos_gui[i])) and not math.isnan(float(cos_closed[i])))
+        (acc_gui[i] - acc_closed[i])
+        if (acc_gui[i] not in (None, 0.0) and acc_closed[i] not in (None, 0.0)
+            and not math.isnan(float(acc_gui[i])) and not math.isnan(float(acc_closed[i])))
         else float('nan')
         for i in range(len(steps))
     ]
@@ -199,8 +197,8 @@ def create_plot(metrics, output_file):
     ax.plot(steps, smooth(gap), color='coral', linewidth=2, label='gui − closed gap')
     ax.axhline(y=0, linestyle=':', color='black', alpha=0.4)
     ax.set_xlabel('Step')
-    ax.set_ylabel('cos_sim_gui − cos_sim_closed')
-    ax.set_title('GUI/Closed gap over training\n'
+    ax.set_ylabel('acc_gui − acc_closed')
+    ax.set_title('GUI/Closed accuracy gap over training\n'
                  'Should trend → 0  as GRU learns to retain inventory')
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
@@ -233,13 +231,14 @@ def main():
     valid  = [m for m in metrics if m.get('type_loss')]
     t_vals = [m['type_loss'] for m in valid]
     c_vals = [m['count_loss'] for m in valid if m.get('count_loss')]
+    a_vals = [m['item_acc_all'] for m in valid if m.get('item_acc_all')]
     print(f"\nSummary ({len(metrics)} steps):")
     if t_vals:
-        cos_i = 2.0 * math.exp(-t_vals[0])  - 1.0
-        cos_f = 2.0 * math.exp(-t_vals[-1]) - 1.0
-        print(f"  cos_sim:  {cos_i:+.4f} → {cos_f:+.4f}  (type_loss {t_vals[0]:.4f} → {t_vals[-1]:.4f})")
+        print(f"  item CE loss: {t_vals[0]:.4f} → {t_vals[-1]:.4f}")
     if c_vals:
-        print(f"  cnt_loss: {c_vals[0]:.4f} → {c_vals[-1]:.4f}  (min {min(c_vals):.4f})")
+        print(f"  count CE loss: {c_vals[0]:.4f} → {c_vals[-1]:.4f}  (min {min(c_vals):.4f})")
+    if a_vals:
+        print(f"  item top-1 acc: {a_vals[0]:.4f} → {a_vals[-1]:.4f}  (max {max(a_vals):.4f})")
 
 
 if __name__ == '__main__':

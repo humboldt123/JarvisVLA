@@ -2,7 +2,7 @@
 Auxiliary prediction heads and memory projection layers for Stateful JARVIS-VLA.
 
 This module provides:
-1. InventoryEmbeddingHead: Predicts 768-dim inventory embeddings from hidden state
+1. InventoryClassificationHead: Predicts discrete item IDs and count classes (cross-entropy)
 2. MemoryProjections: W_in (memory→hidden) and W_out (hidden→memory) for recurrent memory
 
 Key Design:
@@ -10,6 +10,7 @@ Key Design:
 - W_in projects memory to model space for input as a token
 - W_out compresses updated memory back to memory_dim
 - Auxiliary head uses raw hidden state (before W_out projection)
+- Item type and count are both discrete classification problems (cross-entropy, not regression)
 """
 
 import torch
@@ -18,100 +19,90 @@ import torch.nn.functional as F
 from typing import Optional, Dict, Tuple, List
 
 
-class InventoryEmbeddingHead(nn.Module):
+class InventoryClassificationHead(nn.Module):
     """
-    Auxiliary head that predicts per-slot inventory state from the memory hidden state.
+    Auxiliary head that predicts per-slot inventory state as discrete classes.
 
-    Outputs two tensors per forward pass:
-        type_embeddings  [batch, num_slots, output_dim]  — L2-normalised BERT-space
-                         embedding for each slot's item type.  Trained with InfoNCE
-                         (contrastive) loss so the model must distinguish items, not
-                         just land in the general "item description" cluster.
-        count_preds      [batch, num_slots]              — predicted log(count+1) for
-                         each slot.  Trained with MSE against log(true_count+1).
+    Outputs two tensors per forward pass (both are raw logits for cross-entropy):
+        item_logits   [batch, num_slots, item_vocab_size]  — item type classification
+        count_logits  [batch, num_slots, count_classes]    — count bucket classification
 
-    # --- Future NBT head (not yet implemented) ---
-    # A third output nbt_embeddings [batch, num_slots, output_dim] would encode
-    # arbitrary NBT metadata (enchantments, durability, custom names, etc.) as a
-    # BERT embedding of the flattened NBT string.  Same InfoNCE loss as the type
-    # head.  Slots with no NBT all map to BERT("no_nbt").
-    # Add: self.nbt_head = copy of fusion + Linear(output_dim, output_dim) + LayerNorm
+    Cross-entropy losses:
+        item_loss  = CE(item_logits.view(-1, item_vocab_size), item_ids.view(-1))
+        count_loss = CE(count_logits[non_empty], count_targets[non_empty])
 
-    Loss computation is done externally in the training loop so that InfoNCE can
-    aggregate non-empty slots across the full BPTT chunk for more negatives.
+    Why cross-entropy instead of cosine similarity:
+        - Gradients are strong until the model is confident on the correct class.
+        - No embedding space to exploit by collapsing to a centroid.
+        - Directly interpretable: output is a probability over item types.
+
+    Phase 2 additions (not yet implemented):
+        - durability_pct: float regression 0.0-1.0
+        - enchant_id / enchant_lvl: classification per enchantment slot (up to 7)
 
     Args:
-        hidden_dim:  Dimension of the model's hidden state (3584 for Qwen2VL-7B)
-        output_dim:  Dimension of BERT embeddings (768)
-        num_slots:   Number of inventory slots (36 for Minecraft)
-        dropout:     Dropout rate
-        temperature: InfoNCE temperature (default 0.07, same as CLIP)
+        hidden_dim:      Dimension of the model's hidden state (3584 for Qwen2VL-7B)
+        item_vocab_size: Number of item classes including empty (0). Default: 976.
+        count_classes:   Number of count bucket classes. Default: 128 (covers 0-127).
+        num_slots:       Number of inventory slots. Default: 36.
+        dropout:         Dropout rate. Default: 0.1.
     """
 
     def __init__(
         self,
         hidden_dim: int,
-        output_dim: int = 768,
+        item_vocab_size: int = 976,
+        count_classes: int = 128,
         num_slots: int = 36,
         dropout: float = 0.1,
-        temperature: float = 0.07,
     ):
         super().__init__()
 
         self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
+        self.item_vocab_size = item_vocab_size
+        self.count_classes = count_classes
         self.num_slots = num_slots
-        self.temperature = temperature
 
         intermediate_dim = hidden_dim // 4
 
-        # Per-slot readout: each of the 36 slots gets its own dedicated projection
-        # direction out of the hidden state.  The old design broadcast a single
-        # 768-dim base vector to all slots and differentiated them with a small
-        # (96-dim) slot-position embedding — so every slot's prediction was nearly
-        # the same linear function of the hidden state.  Here the final Linear maps
-        # to num_slots * output_dim, giving each slot an independent weight row.
-        self.to_slots = nn.Sequential(
+        # Shared trunk: hidden → slot features
+        # Each slot gets an independent projection direction so the head can
+        # learn different readout directions for different slots.
+        self.trunk = nn.Sequential(
             nn.Linear(hidden_dim, intermediate_dim),
             nn.LayerNorm(intermediate_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(intermediate_dim, num_slots * output_dim),
         )
 
-        # Count head: predicts log(count + 1) per slot from the fused representation
-        # Softplus ensures output is always positive (target log(count+1) >= 0)
-        self.count_head = nn.Sequential(
-            nn.Linear(output_dim, output_dim // 4),
-            nn.GELU(),
-            nn.Linear(output_dim // 4, 1),
-            nn.Softplus(),
-        )
+        # Item type head: [batch, intermediate_dim] → [batch, num_slots * item_vocab_size]
+        self.item_head = nn.Linear(intermediate_dim, num_slots * item_vocab_size)
+
+        # Count head: [batch, intermediate_dim] → [batch, num_slots * count_classes]
+        self.count_head = nn.Linear(intermediate_dim, num_slots * count_classes)
 
         self._init_weights()
 
     def _init_weights(self):
-        # gain=0.1 was the bug: it makes to_slots output tiny values (std≈0.02),
-        # so the count_head weight gradients are ≈ 0 and only the bias trains —
-        # at 1e-4/step it would take ~23k steps just to reach the mean target.
-        # gain=1.0 gives fused std≈0.2, L2 norm≈5 per slot, letting both heads
-        # receive meaningful gradients from step 1.
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight, gain=1.0)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, std=0.02)
 
-        # Warm-start the count head's final linear bias so initial predictions
-        # are near log(mean_count+1) ≈ log(9) ≈ 2.2 rather than log(2)≈0.693.
-        # This cuts the initial count_loss by ~70% and makes the gradient
-        # signal informative from the first step instead of just "predict higher".
-        # Softplus(2.2) ≈ 2.3, which corresponds to predicting ~count 9 for every
-        # non-empty slot — a much better prior than predicting count 1.
-        count_final_linear = self.count_head[-2]  # Linear(output_dim//4, 1)
-        nn.init.constant_(count_final_linear.bias, 2.2)
+        # Warm-start item head: bias class 0 (empty) slightly lower so the model
+        # doesn't default to predicting everything as empty from step 1.
+        # Bias ~-0.5 on class 0 vs 0.0 on other classes gives modest prior
+        # toward non-empty predictions.
+        with torch.no_grad():
+            if self.item_head.bias is not None:
+                self.item_head.bias.view(self.num_slots, self.item_vocab_size)[:, 0] -= 0.5
+
+        # Warm-start count head: bias class 1 (count=1) slightly higher — most
+        # non-empty slots have at least 1 item.
+        with torch.no_grad():
+            if self.count_head.bias is not None:
+                self.count_head.bias.view(self.num_slots, self.count_classes)[:, 1] += 0.5
 
     def forward(
         self,
@@ -122,19 +113,27 @@ class InventoryEmbeddingHead(nn.Module):
             hidden_states: [batch, hidden_dim]
 
         Returns:
-            type_embeddings: [batch, num_slots, output_dim]  L2-normalised
-            count_preds:     [batch, num_slots]               predicted log(count+1)
+            item_logits:  [batch, num_slots, item_vocab_size]  — raw logits for CE
+            count_logits: [batch, num_slots, count_classes]    — raw logits for CE
         """
         batch_size = hidden_states.shape[0]
 
-        fused = self.to_slots(hidden_states).view(
-            batch_size, self.num_slots, self.output_dim
-        )                                                              # [batch, S, D]
+        trunk_out = self.trunk(hidden_states)   # [batch, intermediate_dim]
 
-        type_embeddings = F.normalize(fused, p=2, dim=-1)             # [batch, S, D]
-        count_preds = self.count_head(fused).squeeze(-1)               # [batch, S]
+        item_logits = self.item_head(trunk_out).view(
+            batch_size, self.num_slots, self.item_vocab_size
+        )   # [batch, S, item_vocab_size]
 
-        return type_embeddings, count_preds
+        count_logits = self.count_head(trunk_out).view(
+            batch_size, self.num_slots, self.count_classes
+        )   # [batch, S, count_classes]
+
+        return item_logits, count_logits
+
+
+# Backward-compat alias — code that instantiated InventoryEmbeddingHead can
+# be migrated gradually.  The constructor signature differs (see above).
+InventoryEmbeddingHead = InventoryClassificationHead
 
 
 class MemoryProjections(nn.Module):

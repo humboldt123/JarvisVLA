@@ -3,12 +3,12 @@ Sequence Dataset for Stateful VLA Training on OpenVPT Data
 
 This module provides:
 1. VPTSequenceDataset: Returns long sequences of consecutive frames from /data/vvm33/vpt_contractor
-2. InventoryTextEncoder: Frozen BERT encoder for inventory descriptions
+2. InventoryClassEncoder: Discrete item-ID encoder (replaces old trigram encoder)
 
 Data Format (OpenVPT /data/vvm33/vpt_contractor):
     - MP4 files: Gameplay footage
     - JSONL files: Per-tick data with inventory, actions, etc.
-    
+
     JSONL format per tick:
     {
         "tick": int,
@@ -20,11 +20,10 @@ Data Format (OpenVPT /data/vvm33/vpt_contractor):
         ...
     }
 
-Item Encoding:
-    - Each inventory slot is encoded independently via character trigrams (768-dim).
-    - Trigram embeddings are far more discriminative than BERT for short Minecraft
-      item names, and are open-vocabulary (modded items work automatically).
-    - The embedding matrix is fixed (seeded random, never trained).
+Item Encoding (Phase 1 — discrete classification):
+    - item_id:  integer in [0, ITEM_VOCAB_SIZE)  — 0 = empty/unknown
+    - count:    integer in [0, COUNT_CLASSES)     — clamped at 127
+    Both are used as cross-entropy targets (no continuous embeddings).
 """
 
 import json
@@ -40,72 +39,45 @@ try:
     cv2.setLogLevel(0)  # suppress ffmpeg "moov atom not found" spam from truncated VPT files
 except AttributeError:
     pass  # some cv2 builds don't expose setLogLevel
-import hashlib
+
+from jarvisvla.train.mc_item_vocab import (
+    item_name_to_id, item_id_to_name, clamp_count,
+    get_item_vocab_size, COUNT_CLASSES, UNKNOWN_ITEM_ID,
+)
 
 
-class InventoryTextEncoder:
+class InventoryClassEncoder:
     """
-    Character-trigram encoder for Minecraft item type names.
+    Discrete integer encoder for Minecraft inventory slots.
 
-    Replaces the previous BERT encoder. BERT collapsed short domain-specific
-    strings ('oak_log', 'stone_pickaxe') into nearly identical CLS embeddings.
-    Character trigrams are far more discriminative for item identifiers:
-        'oak_log' and 'birch_log' share '_lo', 'log' → similar vectors (correct)
-        'oak_log' and 'diamond_pickaxe' share almost no trigrams → distant vectors
+    Replaces the old trigram-embedding encoder.  Instead of producing
+    768-dim float vectors (which led to cosine-similarity collapse), this
+    encoder maps each slot to:
 
-    Open-vocabulary: any new item name (modded items) decomposes into trigrams
-    automatically — no retraining or fixed vocabulary needed.
+        item_id   int in [0, ITEM_VOCAB_SIZE)  — 0 = empty / unknown
+        count     int in [0, COUNT_CLASSES)    — clamped at 127
 
-    The embedding matrix is fixed (seeded random, never trained), giving a
-    stable target space for the InfoNCE loss.
+    Both are used as cross-entropy targets in training.
+
+    The vocabulary is loaded from minecraft-data 1.16.5 (~975 items).
+    All 81 unique item names seen in the VPT contractor dataset map
+    directly to minecraft-data names — no alias table is needed in practice.
     """
-
-    EMBED_DIM   = 768
-    NUM_BUCKETS = 8192  # trigram hash buckets
-    SEED        = 42
 
     def __init__(
         self,
-        embedding_dim: int = 768,
-        device: str = "cpu",   # kept for API compatibility, unused
+        device: str = "cpu",   # kept for API compat; not used
     ):
-        self.embedding_dim = embedding_dim
-        rng = np.random.default_rng(self.SEED)
-        mat = rng.standard_normal((self.NUM_BUCKETS, embedding_dim)).astype(np.float32)
-        norms = np.linalg.norm(mat, axis=1, keepdims=True)
-        self._matrix = mat / (norms + 1e-8)   # [NUM_BUCKETS, EMBED_DIM], row-normalised
-
-    # ------------------------------------------------------------------
-    # Core encoder
-    # ------------------------------------------------------------------
-
-    def _trigram_hash(self, s: str) -> int:
-        """Deterministic bucket index (not affected by PYTHONHASHSEED)."""
-        return int(hashlib.md5(s.encode()).hexdigest(), 16) % self.NUM_BUCKETS
-
-    def _name_to_embedding(self, name: str) -> np.ndarray:
-        """Map an item type name to a 768-dim unit vector via character trigrams."""
-        name = name.lower()
-        trigrams = [name[i:i+3] for i in range(len(name) - 2)]
-        if not trigrams:
-            trigrams = [name]   # very short names (1-2 chars) use the whole string
-        indices = [self._trigram_hash(t) for t in trigrams]
-        vecs = self._matrix[indices]            # [n_trigrams, EMBED_DIM]
-        mean_vec = vecs.mean(axis=0)
-        norm = np.linalg.norm(mean_vec)
-        return (mean_vec / (norm + 1e-8)).astype(np.float32)
+        # Eagerly resolve vocab size so it's available immediately.
+        self._vocab_size = get_item_vocab_size()
 
     # ------------------------------------------------------------------
     # Slot helpers
     # ------------------------------------------------------------------
 
-    def _slot_to_type_text(self, slot_data: Dict) -> str:
-        """Return just the item type name for BERT encoding, e.g. 'oak_log' or 'empty slot'.
-
-        Separating type from count lets BERT distinguish item names cleanly:
-        'granite count:11' vs 'stone_pickaxe count:1' collapse to nearly identical
-        BERT CLS embeddings; 'granite' vs 'stone_pickaxe' do not.
-        """
+    @staticmethod
+    def _slot_to_type_text(slot_data: Dict) -> str:
+        """Return canonical item name string, e.g. 'oak_log' or 'empty slot'."""
         item_type = slot_data.get('type', '')
         quantity = slot_data.get('quantity', 0)
         if item_type and item_type != 'air' and quantity > 0:
@@ -114,53 +86,23 @@ class InventoryTextEncoder:
             return item_type
         return "empty slot"
 
-    def _slot_to_count(self, slot_data: Dict) -> int:
-        """Return the item stack count (0 for empty/air slots)."""
+    @staticmethod
+    def _slot_to_id(slot_data: Dict) -> int:
+        """Map a slot dict to its integer item ID (0 = empty)."""
+        item_type = slot_data.get('type', '')
+        quantity = slot_data.get('quantity', 0)
+        if not item_type or item_type == 'air' or quantity <= 0:
+            return UNKNOWN_ITEM_ID
+        return item_name_to_id(item_type)
+
+    @staticmethod
+    def _slot_to_count(slot_data: Dict) -> int:
+        """Return clamped count class (0 for empty/air slots)."""
         item_type = slot_data.get('type', '')
         quantity = slot_data.get('quantity', 0)
         if item_type and item_type != 'air' and quantity > 0:
-            return int(quantity)
+            return clamp_count(quantity)
         return 0
-
-    def _slot_to_nbt_text(self, slot_data: Dict) -> str:
-        """Return a canonical text string encoding any NBT metadata.
-
-        Currently returns 'no_nbt' — placeholder until the richer data-collection
-        mod provides NBT.
-
-        # --- Future NBT implementation ---
-        # The mod will supply an 'nbt' dict in the JSONL tick, e.g.:
-        #   {"type": "diamond_pickaxe", "quantity": 1,
-        #    "nbt": {"enchantments": {"sharpness": 2, "unbreaking": 3},
-        #            "damage": 150}}
-        #
-        # Strategy: recursively flatten the nbt dict into sorted key=value pairs
-        # separated by spaces, e.g. "enchantments.sharpness=2
-        # enchantments.unbreaking=3 damage=150".  Sorting by key makes identical
-        # NBT always produce identical strings regardless of insertion order.
-        # BERT-encode this string → 768-dim → InfoNCE loss against other NBT
-        # strings in the batch, identical to the type head.
-        #
-        # Items with no NBT all map to "no_nbt" (same BERT embedding) so the
-        # nbt_head learns to distinguish vanilla vs enchanted items without
-        # needing to discriminate between two plain items.  New enchant types or
-        # arbitrary mod NBT fields appear as new BERT tokens automatically.
-        #
-        # def _flatten_nbt(nbt: dict, prefix: str = "") -> List[str]:
-        #     pairs = []
-        #     for k, v in sorted(nbt.items()):
-        #         key = f"{prefix}.{k}" if prefix else k
-        #         if isinstance(v, dict):
-        #             pairs.extend(_flatten_nbt(v, key))
-        #         else:
-        #             pairs.append(f"{key}={v}")
-        #     return pairs
-        #
-        # nbt = slot_data.get('nbt', {})
-        # if nbt:
-        #     return ' '.join(_flatten_nbt(nbt))
-        """
-        return "no_nbt"
 
     @staticmethod
     def inventory_has_items(inventory_list: List[Dict]) -> bool:
@@ -170,40 +112,38 @@ class InventoryTextEncoder:
             for item in inventory_list
         )
 
-    def encode_inventory_per_slot(
+    def encode_inventory_ids(
         self,
         inventory_list: List[Dict],
         num_slots: int = 36,
     ) -> torch.Tensor:
         """
-        Encode each inventory slot to a 768-dim unit vector via character trigrams.
+        Encode each inventory slot to an integer item ID.
 
-        Returns [num_slots, 768]. Slot assignment uses the 'slot' field if
-        present, else list order.
+        Returns LongTensor [num_slots].  ID 0 means empty / unrecognised.
+        Slot assignment uses the 'slot' field if present, else list order.
 
         Args:
             inventory_list: List of {type, quantity, slot?, ...} dicts
             num_slots: Number of inventory slots (default: 36 for Minecraft)
-
-        Returns:
-            embeddings: [num_slots, 768] normalised per-slot embeddings
         """
-        slot_names = ["empty slot"] * num_slots
+        slot_ids = torch.zeros(num_slots, dtype=torch.long)
         for i, item in enumerate(inventory_list):
             slot_idx = item.get('slot', i)
-            if isinstance(slot_idx, int) and 0 <= slot_idx < num_slots:
-                slot_names[slot_idx] = self._slot_to_type_text(item)
-            elif i < num_slots:
-                slot_names[i] = self._slot_to_type_text(item)
-        vecs = np.stack([self._name_to_embedding(n) for n in slot_names])  # [num_slots, 768]
-        return torch.from_numpy(vecs)
+            item_id = self._slot_to_id(item)
+            if item_id != UNKNOWN_ITEM_ID:
+                if isinstance(slot_idx, int) and 0 <= slot_idx < num_slots:
+                    slot_ids[slot_idx] = item_id
+                elif i < num_slots:
+                    slot_ids[i] = item_id
+        return slot_ids
 
     def encode_inventory_counts(
         self,
         inventory_list: List[Dict],
         num_slots: int = 36,
     ) -> torch.Tensor:
-        """Return a LongTensor [num_slots] of item counts (0 for empty slots)."""
+        """Return a LongTensor [num_slots] of clamped count classes (0 for empty slots)."""
         slot_counts = torch.zeros(num_slots, dtype=torch.long)
         for i, item in enumerate(inventory_list):
             slot_idx = item.get('slot', i)
@@ -214,6 +154,10 @@ class InventoryTextEncoder:
                 elif i < num_slots:
                     slot_counts[i] = count
         return slot_counts
+
+
+# Backward-compat alias — old code that imported InventoryTextEncoder still works.
+InventoryTextEncoder = InventoryClassEncoder
 
 
 class VPTSequenceDataset(IterableDataset):
@@ -369,17 +313,22 @@ class VPTSequenceDataset(IterableDataset):
         # Generate text prompts
         texts = self._generate_texts(ticks)
         
-        # Encode inventory with BERT — per-slot: [seq_len, 36, 768]
+        # Encode inventory — discrete IDs and count classes
         if self.inventory_encoder is not None:
-            inventory_embeddings = torch.stack([
-                self.inventory_encoder.encode_inventory_per_slot(t['inventory'])
+            inventory_ids = torch.stack([
+                self.inventory_encoder.encode_inventory_ids(t['inventory'])
+                for t in ticks
+            ])
+            inventory_counts = torch.stack([
+                self.inventory_encoder.encode_inventory_counts(t['inventory'])
                 for t in ticks
             ])
             inventory_has_items = [
-                InventoryTextEncoder.inventory_has_items(t['inventory']) for t in ticks
+                InventoryClassEncoder.inventory_has_items(t['inventory']) for t in ticks
             ]
         else:
-            inventory_embeddings = torch.zeros(len(ticks), 36, 768)
+            inventory_ids = torch.zeros(len(ticks), 36, dtype=torch.long)
+            inventory_counts = torch.zeros(len(ticks), 36, dtype=torch.long)
             inventory_has_items = [False] * len(ticks)
 
         # Extract actions
@@ -388,7 +337,8 @@ class VPTSequenceDataset(IterableDataset):
         return {
             'frames': frames,
             'texts': texts,
-            'inventory_embeddings': inventory_embeddings,
+            'inventory_ids': inventory_ids,
+            'inventory_counts': inventory_counts,
             'inventory_has_items': inventory_has_items,
             'actions': actions,
             'video_path': video_path,
@@ -614,8 +564,9 @@ class OnDemandSequenceLoader:
 
     Each returned sequence dict contains:
         frames: List[PIL.Image]  (length = sequence_length)
-        inventory_embeddings: [seq_len, 36, 768]  per-slot BERT targets
-        inventory_has_items: List[bool]  cheap non-empty flag (no BERT needed at train time)
+        inventory_ids: [seq_len, 36]  integer item IDs (0=empty)
+        inventory_counts: [seq_len, 36]  count classes 0-127
+        inventory_has_items: List[bool]  cheap non-empty flag
         ticks: List[dict]  raw JSONL tick data
         source_file: str
     """
@@ -624,7 +575,7 @@ class OnDemandSequenceLoader:
         self,
         jsonl_files: List[Path],
         sequence_length: int,
-        encoder: InventoryTextEncoder,
+        encoder: InventoryClassEncoder,
         cache_size: int = 500,
     ):
         self.jsonl_files = jsonl_files
@@ -712,16 +663,16 @@ class OnDemandSequenceLoader:
         while len(frames) < self.sequence_length:
             frames.append(Image.new('RGB', (224, 224), color='black'))
 
-        # Per-slot BERT type targets: [seq_len, 36, 768]  (type name only, no count)
-        inv_embs = torch.stack([
-            self.encoder.encode_inventory_per_slot(t['inventory']) for t in ticks
+        # Per-slot integer item IDs: [seq_len, 36]  (0 = empty)
+        inv_ids = torch.stack([
+            self.encoder.encode_inventory_ids(t['inventory']) for t in ticks
         ])
-        # Per-slot integer counts: [seq_len, 36]
+        # Per-slot count classes: [seq_len, 36]  (0 = empty, clamped to 0-127)
         inv_counts = torch.stack([
             self.encoder.encode_inventory_counts(t['inventory']) for t in ticks
         ])
         # Cheap non-empty flag
-        has_items = [InventoryTextEncoder.inventory_has_items(t['inventory']) for t in ticks]
+        has_items = [InventoryClassEncoder.inventory_has_items(t['inventory']) for t in ticks]
         # True when the inventory screen is actually visible in the frame.
         # This is when Qwen can get a direct visual update on item contents.
         is_gui_inventory = [bool(t.get('isGuiInventory', False)) for t in ticks]
@@ -741,11 +692,11 @@ class OnDemandSequenceLoader:
 
         return {
             'frames': frames,
-            'inventory_embeddings': inv_embs,       # [seq_len, 36, 768] type BERT embs
-            'inventory_counts': inv_counts,          # [seq_len, 36] int counts
+            'inventory_ids': inv_ids,                # [seq_len, 36] item IDs (0=empty)
+            'inventory_counts': inv_counts,          # [seq_len, 36] count classes 0-127
             'inventory_has_items': has_items,        # List[bool] — player has any items
             'is_gui_inventory': is_gui_inventory,    # List[bool] — inventory screen visible
-            'inventory_slot_texts': slot_texts_per_tick,  # type names for NN vocab
+            'inventory_slot_texts': slot_texts_per_tick,  # type names for display/eval
             'ticks': ticks,
             'source_file': jsonl_file.name,
         }
