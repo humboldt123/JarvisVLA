@@ -585,18 +585,63 @@ class OnDemandSequenceLoader:
         self.cache_size = cache_size
         # index: list of (jsonl_idx, num_sequences_in_file)
         self.index: List[Tuple[int, int]] = []
+        self._build_index()
+
+    def _build_index(self):
+        """Build file index, using a persistent tick-count cache to skip re-scanning."""
+        jsonl_files   = self.jsonl_files
+        seq_len       = self.sequence_length
+
+        # ── Locate / load the cache ──────────────────────────────────────────
+        # Put the cache file next to the JSONL files so it persists across runs.
+        cache_path: Optional[Path] = None
+        tick_count_cache: Dict[str, int] = {}
+        if jsonl_files:
+            cache_path = jsonl_files[0].parent / '_tick_count_cache.json'
+            if cache_path.exists():
+                try:
+                    with open(cache_path, 'r') as fh:
+                        tick_count_cache = json.load(fh)
+                except Exception:
+                    tick_count_cache = {}
+
+        cache_dirty = False
+        n_scanned   = 0
 
         for jsonl_idx, jsonl_file in enumerate(jsonl_files):
             mp4_file = jsonl_file.with_suffix('.mp4')
             if not mp4_file.exists():
                 continue
-            tick_count = 0
-            with open(jsonl_file, 'r', encoding='utf-8', errors='ignore') as f:
-                for _ in f:
-                    tick_count += 1
-            num_seqs = max(0, (tick_count - sequence_length) // sequence_length + 1)
+
+            file_key = str(jsonl_file)
+            if file_key in tick_count_cache:
+                tick_count = tick_count_cache[file_key]
+            else:
+                tick_count = 0
+                with open(jsonl_file, 'r', encoding='utf-8', errors='ignore') as fh:
+                    for _ in fh:
+                        tick_count += 1
+                tick_count_cache[file_key] = tick_count
+                cache_dirty = True
+                n_scanned  += 1
+
+            num_seqs = max(0, (tick_count - seq_len) // seq_len + 1)
             if num_seqs > 0:
                 self.index.append((jsonl_idx, num_seqs))
+
+        if n_scanned:
+            print(f"  [OnDemandLoader] scanned {n_scanned} new files "
+                  f"({len(jsonl_files) - n_scanned} served from cache)")
+        else:
+            print(f"  [OnDemandLoader] all {len(jsonl_files)} files served from cache")
+
+        # ── Persist updated cache ────────────────────────────────────────────
+        if cache_dirty and cache_path is not None:
+            try:
+                with open(cache_path, 'w') as fh:
+                    json.dump(tick_count_cache, fh)
+            except Exception as exc:
+                print(f"  [OnDemandLoader] warning: could not write cache: {exc}")
 
     def __len__(self) -> int:
         return sum(count for _, count in self.index)

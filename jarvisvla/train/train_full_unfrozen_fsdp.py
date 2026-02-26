@@ -433,6 +433,12 @@ def main():
                              'Cuts activation memory ~10x at ~2x compute cost, '
                              'allowing longer bptt_chunk_size on the same VRAM.')
     parser.add_argument('--grad_accum_steps', type=int, default=64)
+    parser.add_argument('--seq_load_len', type=int, default=500,
+                        help='Frames loaded per sequence.  The BPTT window slides '
+                             'through the sequence in bptt_chunk_size steps, carrying '
+                             'detached memory across chunks.  Larger values amortise '
+                             'MP4 decode cost across more training steps.  Default 500 '
+                             'gives ~60 BPTT chunks per disk read with chunk_size=8.')
     parser.add_argument('--frozen_backbone', action='store_true',
                         help='Freeze all backbone (Qwen2-VL) parameters — only GRU memory '
                              'projections and inventory head train.  SPEED ABLATION ONLY: '
@@ -575,11 +581,11 @@ def main():
     jsonl_files = sorted(Path(args.data_dir).glob("*.jsonl"))
     train_files = jsonl_files[:args.train_jsonls]
     test_files  = jsonl_files[args.train_jsonls:args.train_jsonls + args.test_jsonls]
-    # Load sequences long enough for one full BPTT chunk.
-    # We load bptt_chunk_size + 100 extra frames so the anchor (gui-open) can
-    # sit anywhere in the first 100 frames and still leave a full bptt_chunk_size
-    # window behind it for the memory to operate over.
-    seq_load_len = args.bptt_chunk_size + 100
+    # Sequence length for the sliding BPTT window.
+    # The window advances by bptt_chunk_size each outer step, carrying detached
+    # memory across chunks.  seq_load_len controls how many BPTT chunks we get
+    # per disk read: roughly (seq_load_len - first_anchor_pos) / bptt_chunk_size.
+    seq_load_len = args.seq_load_len
     train_loader = OnDemandSequenceLoader(train_files, seq_load_len, encoder)
     test_loader  = OnDemandSequenceLoader(test_files,  seq_load_len, encoder)
 
@@ -610,6 +616,14 @@ def main():
     last_avg_type  = None
     last_avg_count = None
 
+    # Sliding BPTT window state — one disk read amortised across many outer steps.
+    # The window advances by bptt_chunk_size each step.  Memory is carried over
+    # (detached) between chunks from the same sequence and reset to zeros only
+    # when a new sequence is loaded.
+    _cur_seq     = None   # currently loaded sequence dict
+    _cur_seq_pos = 0      # next frame index to use as start_idx
+    _cur_memory  = None   # detached memory tensor from previous chunk (None = use zeros)
+
     for step in range(start_step, args.train_steps):
         step_start = time.time()
         
@@ -626,33 +640,36 @@ def main():
         chunk_acc_closed: List[float] = []
         chunk_n_gui = 0            # how many frames had the GUI open this step
 
-        memory = torch.zeros(1, args.memory_dim, device=device, dtype=torch.bfloat16)
+        # Sliding BPTT window: load a new sequence only when the current one is
+        # exhausted.  Within a sequence the window advances by bptt_chunk_size
+        # each outer step — no frame is ever processed twice.  Memory is carried
+        # over (detached) between chunks so the GRU must maintain state across the
+        # entire sequence, not just a single 8-frame burst.
+        _need_new_seq = (
+            _cur_seq is None
+            or _cur_seq_pos + args.bptt_chunk_size > len(_cur_seq['frames'])
+        )
+        if _need_new_seq:
+            for _seq_retry in range(20):
+                seq_idx = torch.randint(0, len(train_loader), (1,)).item()
+                seq     = train_loader[seq_idx]
+                gui_open = seq['is_gui_inventory']
+                # Start at the first GUI-open frame so chunk 0 always has a visual read.
+                open_frames = [i for i in range(len(gui_open)) if gui_open[i]]
+                if open_frames:
+                    break
+            _cur_seq     = seq
+            _cur_seq_pos = open_frames[0] if open_frames else 0
+            _cur_memory  = None   # new sequence → reset memory to zeros
 
-        # Find a sequence where the inventory screen is actually open (isGuiInventory)
-        # somewhere in the first 100 frames, then start the BPTT window there.
-        #
-        # The window layout is:
-        #   [anchor=gui_open]  →  [closed] → [closed] → ... (bptt_chunk_size frames)
-        #
-        # Frame 0: inventory screen visible → Qwen gets a direct visual read → memory updates.
-        # Frames 1-N: screen closed → model must use memory to predict inventory.
-        # Loss fires at every frame from JSONL ground truth (screen-open or not).
-        # This is exactly the temporal test we want: "remember what you saw."
-        for _seq_retry in range(20):
-            seq_idx = torch.randint(0, len(train_loader), (1,)).item()
-            seq = train_loader[seq_idx]
-            gui_open = seq['is_gui_inventory']   # List[bool], len = seq_load_len
-            # Only look in the first 100 frames so the full bptt_chunk_size fits after
-            searchable = min(100, len(gui_open) - args.bptt_chunk_size)
-            open_frames = [i for i in range(searchable) if gui_open[i]]
-            if open_frames:
-                break
-        if not open_frames:
-            # No gui-open frame found — fall back to frame 0 (model trains from scratch)
-            start_idx = 0
+        seq       = _cur_seq
+        start_idx = _cur_seq_pos
+
+        # Memory: zeros at sequence start; detached carry-over within the sequence.
+        if _cur_memory is None:
+            memory = torch.zeros(1, args.memory_dim, device=device, dtype=torch.bfloat16)
         else:
-            anchor = open_frames[torch.randint(0, len(open_frames), (1,)).item()]
-            start_idx = anchor
+            memory = _cur_memory
 
         scale = args.bptt_chunk_size * args.grad_accum_steps
 
@@ -789,7 +806,12 @@ def main():
         memory_norm_end = memory.detach().float().norm().item()
 
         # Single backward through the full bptt_chunk_size frame sequence.
-        # Gradient flows back through GRU recurrence across all frames.
+        # Advance the sliding window BEFORE backward so _cur_memory is a plain
+        # data tensor unaffected by graph freeing.
+        _cur_memory  = memory.detach()   # carry to next chunk; cut gradient flow
+        _cur_seq_pos = start_idx + args.bptt_chunk_size
+
+        # Gradient flows back through GRU recurrence across all frames in this chunk.
         if seq_loss is not None:
             seq_loss.backward()
 
