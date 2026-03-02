@@ -2,17 +2,29 @@
 Auxiliary prediction heads and memory projection layers for Stateful JARVIS-VLA.
 
 This module provides:
-1. InventoryClassificationHead: Predicts discrete item IDs and count classes (cross-entropy)
-2. MemoryProjections: W_in (memory→hidden) and W_out (hidden→memory) for recurrent memory
+1. InventoryClassificationHead: (legacy) single-vector linear probe — mode collapses to modal item
+2. SlotCrossAttentionInventoryHead: DETR-style per-slot cross-attention over image patches (current)
+3. MemoryProjections: W_in (memory→hidden) and W_out (hidden→memory) for recurrent memory
 
 Key Design:
-- Memory dimension (512) is separate from model hidden dimension (3584 for Qwen2VL-7B)
+- Memory dimension (1024) is separate from model hidden dimension (3584 for Qwen2VL-7B)
 - W_in projects memory to model space for input as a token
-- W_out compresses updated memory back to memory_dim
-- Auxiliary head uses raw hidden state (before W_out projection)
-- Item type and count are both discrete classification problems (cross-entropy, not regression)
+- W_out compresses updated memory back to memory_dim (GRU-gated)
+- SlotCrossAttentionInventoryHead reads image-patch hiddens from an intermediate layer
+  (not the last-token summary used by the old linear probe)
+- Item type and count are discrete CE classification (not regression)
+
+Why SlotCrossAttentionInventoryHead fixes mode collapse:
+  Old head: raw_memory_hidden [3584] → Linear → [36*976] logits
+    - All 36 slots share one vector → model learns marginal distribution (always cobblestone)
+    - Last text-token hidden state encodes "next token prediction" not spatial inventory layout
+  New head: image_patch_hiddens [N_patches, 3584] → cross-attn with 36 slot queries
+    - Each slot query independently attends to different spatial regions
+    - Probes intermediate layer (~16/28) with richer spatial features than final layer
+    - Gradients from inventory loss flow directly into spatial feature representations
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -134,6 +146,171 @@ class InventoryClassificationHead(nn.Module):
 # Backward-compat alias — code that instantiated InventoryEmbeddingHead can
 # be migrated gradually.  The constructor signature differs (see above).
 InventoryEmbeddingHead = InventoryClassificationHead
+
+
+class SlotCrossAttentionInventoryHead(nn.Module):
+    """
+    Per-slot cross-attention inventory head (DETR / BLIP-2 style).
+
+    Architecture:
+        image_patch_hiddens [batch, N_patches, hidden_dim]   ← from intermediate Qwen layer
+                        ↓  patch_proj (linear, no bias)
+        keys_values     [batch, N_patches, slot_dim]
+                        ↑
+        slot_queries    [batch, 36, slot_dim]   ← 36 learnable params, one per inv slot
+                        ↓  MultiheadAttention
+        attn_out        [batch, 36, slot_dim]
+                        ↓  residual + LayerNorm
+        slot_features   [batch, 36, slot_dim]
+                        ↓  two independent per-slot MLPs
+        item_logits     [batch, 36, item_vocab_size]   (CE, all slots)
+        count_logits    [batch, 36, count_classes]     (CE, non-empty slots)
+
+    Why this fixes mode collapse:
+      - Each of the 36 slot queries learns a different spatial attention pattern
+        over the image patches, so slots are not forced to share one readout vector.
+      - The intermediate layer (default: layer 16/28) carries richer spatial features
+        than the final layer (which is dominated by next-token-prediction statistics).
+      - Gradients from inventory CE loss flow directly into the spatial transformer
+        hidden states, teaching the backbone to encode world-state information.
+
+    Args:
+        hidden_dim:      Dimension of image patch hiddens (3584 for Qwen2VL-7B).
+        slot_dim:        Internal dim for slot queries and cross-attention (256).
+        n_heads:         Number of cross-attention heads (8, head_dim = slot_dim/n_heads).
+        item_vocab_size: Number of item classes including empty (976 for MC 1.16.5).
+        count_classes:   Number of count bucket classes 0–127 (128).
+        num_slots:       Number of inventory slots (36).
+        dropout:         Dropout rate applied inside MLP and cross-attention (0.1).
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 3584,
+        slot_dim: int = 256,
+        n_heads: int = 8,
+        item_vocab_size: int = 976,
+        count_classes: int = 128,
+        num_slots: int = 36,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        assert slot_dim % n_heads == 0, (
+            f"slot_dim ({slot_dim}) must be divisible by n_heads ({n_heads})"
+        )
+
+        self.hidden_dim = hidden_dim
+        self.slot_dim = slot_dim
+        self.item_vocab_size = item_vocab_size
+        self.count_classes = count_classes
+        self.num_slots = num_slots
+
+        # 36 learnable slot queries — initialised small so early cross-attention
+        # is near-uniform and each query can specialise independently.
+        self.slot_queries = nn.Parameter(
+            torch.randn(num_slots, slot_dim) * (slot_dim ** -0.5)
+        )
+
+        # Project image patch hiddens from hidden_dim (3584) down to slot_dim (256).
+        # No bias: the layer norm inside the cross-attention head will handle offsets.
+        self.patch_proj = nn.Linear(hidden_dim, slot_dim, bias=False)
+
+        # Cross-attention: slot queries attend to projected patch features.
+        # batch_first=True so shapes are [batch, seq, dim] throughout.
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=slot_dim,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        # Post-attention layer norm (pre-norm residual).
+        self.attn_norm = nn.LayerNorm(slot_dim)
+
+        # Per-slot MLP for item type classification.
+        self.item_mlp = nn.Sequential(
+            nn.LayerNorm(slot_dim),
+            nn.Linear(slot_dim, slot_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(slot_dim * 2, item_vocab_size),
+        )
+
+        # Per-slot MLP for count bucket classification.
+        self.count_mlp = nn.Sequential(
+            nn.LayerNorm(slot_dim),
+            nn.Linear(slot_dim, slot_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(slot_dim * 2, count_classes),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # patch_proj: small gain so patch features aren't overwhelmed early
+        nn.init.xavier_uniform_(self.patch_proj.weight, gain=0.5)
+
+        # MLPs: standard Xavier; then warm-start biases on the output layers
+        for mlp in [self.item_mlp, self.count_mlp]:
+            for module in mlp.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight, gain=1.0)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+
+        # Warm-start item head: class 0 (empty) slightly lower → model doesn't
+        # immediately collapse to "predict everything as empty".
+        last_item = self.item_mlp[-1]
+        if last_item.bias is not None:
+            with torch.no_grad():
+                last_item.bias[0] -= 0.5
+
+        # Warm-start count head: class 1 (count=1) slightly higher → most non-empty
+        # slots have at least 1 item, so this is a reasonable prior.
+        last_count = self.count_mlp[-1]
+        if last_count.bias is not None:
+            with torch.no_grad():
+                last_count.bias[1] += 0.5
+
+    def forward(
+        self,
+        patch_hiddens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            patch_hiddens: [batch, N_kv, hidden_dim]
+                Keys/values for cross-attention. In practice this is:
+                  [memory_token_hidden (1)] + [image_patch_hiddens (N_patches)]
+                concatenated along dim=1. Including the memory token gives slot
+                queries direct access to GRU-stored inventory on GUI-closed frames,
+                while still allowing spatial readout from image patches on GUI-open frames.
+
+        Returns:
+            item_logits:  [batch, num_slots, item_vocab_size]  — raw CE logits
+            count_logits: [batch, num_slots, count_classes]    — raw CE logits
+        """
+        batch_size = patch_hiddens.shape[0]
+
+        # Project patches to slot_dim: [batch, N_patches, slot_dim]
+        keys_values = self.patch_proj(patch_hiddens)
+
+        # Expand slot queries to batch: [batch, num_slots, slot_dim]
+        queries = self.slot_queries.unsqueeze(0).expand(batch_size, -1, -1)
+
+        # Cross-attention: each slot query attends to all image patches
+        # attn_out: [batch, num_slots, slot_dim]
+        attn_out, _ = self.cross_attn(queries, keys_values, keys_values)
+
+        # Residual connection + LayerNorm
+        slot_features = self.attn_norm(queries + attn_out)  # [batch, num_slots, slot_dim]
+
+        # Per-slot classification heads
+        item_logits  = self.item_mlp(slot_features)   # [batch, num_slots, item_vocab_size]
+        count_logits = self.count_mlp(slot_features)  # [batch, num_slots, count_classes]
+
+        return item_logits, count_logits
 
 
 class MemoryProjections(nn.Module):

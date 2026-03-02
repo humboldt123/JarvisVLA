@@ -87,6 +87,27 @@ def build_inventory_answer(slot_type_texts, slot_counts, prefix):
     return f"{prefix} nothing."
 
 
+def build_slot_text_target(slot_type_texts, slot_counts) -> str:
+    """Structured slot-by-slot inventory text for LM supervision.
+
+    Format: [slot_N] item_name count:C   (one per line)
+    Extensible: add damage:D enchants:[...] in future iterations without
+    any architecture changes — just extend this string.
+
+    Used as the assistant answer in teacher-forced LM fine-tuning on
+    GUI-open frames.  Forces the language head to stay active and prevents
+    backbone representation rank collapse (effective rank staying high
+    rather than collapsing to a few dominant directions).
+    """
+    lines = []
+    for i, (text, count) in enumerate(zip(slot_type_texts, slot_counts)):
+        if text == 'empty slot' or int(count) == 0:
+            lines.append(f"[slot_{i}] empty")
+        else:
+            lines.append(f"[slot_{i}] {text} count:{int(count)}")
+    return "\n".join(lines)
+
+
 class MetricsLogger:
     """Logs training metrics in JSON Lines format for easy plotting."""
     
@@ -449,6 +470,17 @@ def main():
                              'to avoid replicating 8 B frozen params across GPUs.')
     parser.add_argument('--resume_from', type=str, default=None)
     parser.add_argument('--log_every', type=int, default=10, help='Log metrics every N steps')
+    parser.add_argument('--context_frames', type=int, default=4,
+                        help='Number of consecutive frames passed as visual context per forward '
+                             'call (JarvisVLA-style).  Frame t sees [t-ctx+1 … t], padded with '
+                             'the earliest available frame.  Larger values give the model richer '
+                             'temporal context at the cost of ~context_frames× more image tokens.')
+    parser.add_argument('--inv_warmup_steps', type=int, default=500,
+                        help='Linear warmup steps for inventory/count loss weights.  '
+                             'Ramps from 0 → inventory_weight / count_weight over this many '
+                             'steps.  Prevents the auxiliary gradient from destabilising the '
+                             'backbone before the head has converged (observed 300k grad-norm '
+                             'spikes without warmup).')
     args = parser.parse_args()
     
     # Setup
@@ -612,17 +644,15 @@ def main():
     # always shows "what did the gradient that just fired actually represent?"
     win_type_losses  = []
     win_count_losses = []
+    win_lm_losses    = []
     # Cached smoothed values — shown at every log step even between update steps
     last_avg_type  = None
     last_avg_count = None
+    last_avg_lm    = None
 
-    # Sliding BPTT window state — one disk read amortised across many outer steps.
-    # The window advances by bptt_chunk_size each step.  Memory is carried over
-    # (detached) between chunks from the same sequence and reset to zeros only
-    # when a new sequence is loaded.
-    _cur_seq     = None   # currently loaded sequence dict
-    _cur_seq_pos = 0      # next frame index to use as start_idx
-    _cur_memory  = None   # detached memory tensor from previous chunk (None = use zeros)
+    _cur_seq       = None   # currently loaded sequence dict
+    _cur_frame_pos = 0      # start of current BPTT chunk within _cur_seq
+    _cur_memory    = None   # detached memory carry-over (None = reset to zeros)
 
     for step in range(start_step, args.train_steps):
         step_start = time.time()
@@ -632,6 +662,7 @@ def main():
         chunk_losses = []
         chunk_type_losses = []     # item CE loss (logged as "type_loss" for plot compat)
         chunk_count_losses = []
+        chunk_lm_losses   = []    # LM cross-entropy on GUI-frame inventory text targets
         chunk_n_ne = []            # non-empty slot counts per frame
         chunk_type_losses_gui    = []   # item loss on GUI-open frames
         chunk_type_losses_closed = []   # item loss on GUI-closed frames
@@ -640,30 +671,19 @@ def main():
         chunk_acc_closed: List[float] = []
         chunk_n_gui = 0            # how many frames had the GUI open this step
 
-        # Sliding BPTT window: load a new sequence only when the current one is
-        # exhausted.  Within a sequence the window advances by bptt_chunk_size
-        # each outer step — no frame is ever processed twice.  Memory is carried
-        # over (detached) between chunks so the GRU must maintain state across the
-        # entire sequence, not just a single 8-frame burst.
+        # Load a new sequence when the current one is exhausted.
         _need_new_seq = (
             _cur_seq is None
-            or _cur_seq_pos + args.bptt_chunk_size > len(_cur_seq['frames'])
+            or _cur_frame_pos + args.bptt_chunk_size > len(_cur_seq['frames'])
         )
         if _need_new_seq:
-            for _seq_retry in range(20):
-                seq_idx = torch.randint(0, len(train_loader), (1,)).item()
-                seq     = train_loader[seq_idx]
-                gui_open = seq['is_gui_inventory']
-                # Start at the first GUI-open frame so chunk 0 always has a visual read.
-                open_frames = [i for i in range(len(gui_open)) if gui_open[i]]
-                if open_frames:
-                    break
-            _cur_seq     = seq
-            _cur_seq_pos = open_frames[0] if open_frames else 0
-            _cur_memory  = None   # new sequence → reset memory to zeros
+            seq_idx        = torch.randint(0, len(train_loader), (1,)).item()
+            _cur_seq       = train_loader[seq_idx]
+            _cur_frame_pos = 0
+            _cur_memory    = None   # new sequence → reset memory to zeros
 
-        seq       = _cur_seq
-        start_idx = _cur_seq_pos
+        seq           = _cur_seq
+        chunk_indices = list(range(_cur_frame_pos, _cur_frame_pos + args.bptt_chunk_size))
 
         # Memory: zeros at sequence start; detached carry-over within the sequence.
         if _cur_memory is None:
@@ -673,43 +693,23 @@ def main():
 
         scale = args.bptt_chunk_size * args.grad_accum_steps
 
+        # Auxiliary loss weight: linear warmup from 0 → full over inv_warmup_steps.
+        # Prevents 300k+ grad-norm spikes observed when starting at full weight.
+        _warmup        = min(1.0, step / max(1, args.inv_warmup_steps))
+        eff_inv_weight = args.inventory_weight * _warmup
+        eff_cnt_weight = args.count_weight     * _warmup
+
         # ── Preprocessor optimisation ──────────────────────────────────────────
-        # Calling processor(text=..., images=[frame]) inside the per-frame loop
-        # runs BPE tokenisation + chat-template expansion + image preprocessing
-        # on every iteration.  The text never changes between frames, so we
-        # separate the two concerns:
-        #
-        #   1. Tokenise ONCE → static input_ids / attention_mask valid for all
-        #      frames (all frames are 224×224, so image_grid_thw is also constant).
-        #
-        #   2. Batch-preprocess all chunk frames in ONE image-processor call
-        #      instead of bptt_chunk_size individual calls, then split the packed
-        #      pixel_values tensor by image_grid_thw before the inner loop.
-        #
-        # This eliminates ~(bptt_chunk_size - 1) tokenisation calls and folds
-        # N image-processor calls into one batched call per outer step.
-        _dummy_frame = seq['frames'][start_idx]
-        chat_text = processor.apply_chat_template(
-            [{"role": "user", "content": [
-                {"type": "image", "image": _dummy_frame},
-                {"type": "text", "text": "What is in the inventory?"},
-            ]}],
-            tokenize=False, add_generation_prompt=True,
-        )
-
-        # Static text inputs — identical for every frame in the chunk
-        _static = processor(text=chat_text, images=[_dummy_frame], return_tensors="pt")
-        _static_input_ids = _static['input_ids'].to(device)       # [1, seq_len]
-        _static_attn_mask = _static['attention_mask'].to(device)  # [1, seq_len]
-
-        # Batch pixel preprocessing for the entire BPTT chunk
-        _chunk_end    = min(start_idx + args.bptt_chunk_size, len(seq['frames']))
-        _chunk_frames = seq['frames'][start_idx:_chunk_end]
+        # 1. Batch-preprocess all chunk frames in ONE image-processor call;
+        #    split into per-frame pixel_value tensors for the context window.
+        # 2. Tokenise ONCE for a context_frames-image prompt; the placeholder
+        #    structure is identical across all frames in the chunk (same resolution
+        #    → same image_grid_thw → same number of image tokens per slot).
+        _chunk_frames = [seq['frames'][t] for t in chunk_indices]
         _batch_img    = processor.image_processor(images=_chunk_frames, return_tensors="pt")
-        _raw_pv       = _batch_img['pixel_values']           # [total_patches, …] packed
-        _thw          = _batch_img['image_grid_thw']         # [N, 3]  T×H×W per frame
+        _raw_pv       = _batch_img['pixel_values']   # [total_patches, …] packed
+        _thw          = _batch_img['image_grid_thw'] # [N, 3]  T×H×W per frame
 
-        # Split packed pixel_values into per-frame tensors using image_grid_thw
         _pv_per_frame:  list = []
         _thw_per_frame: list = []
         _offset = 0
@@ -718,27 +718,88 @@ def main():
             _pv_per_frame.append(_raw_pv[_offset:_offset + _n].to(device))
             _thw_per_frame.append(_thw[_fi:_fi + 1].to(device))
             _offset += _n
+
+        # Static tokenisation: context_frames image placeholders + random question.
+        # Reused for every frame in the chunk — only pixel_values differ per step.
+        _q_prompt    = random.choice(INVENTORY_QUESTION_PROMPTS)
+        _dummy_frame = _chunk_frames[0]
+        _chat_text   = processor.apply_chat_template(
+            [{"role": "user", "content":
+                [{"type": "image", "image": _dummy_frame}] * args.context_frames
+                + [{"type": "text", "text": _q_prompt}]
+            }],
+            tokenize=False, add_generation_prompt=True,
+        )
+        _static = processor(
+            text=_chat_text,
+            images=[_dummy_frame] * args.context_frames,
+            return_tensors="pt",
+        )
+        _static_input_ids = _static['input_ids'].to(device)       # [1, seq_len]
+        _static_attn_mask = _static['attention_mask'].to(device)  # [1, seq_len]
         # ── End preprocessor optimisation ─────────────────────────────────────
 
-        # True BPTT: accumulate loss across all frames in the window, then call
-        # backward ONCE.  Memory is NOT detached between frames so gradients flow
-        # back through the GRU recurrence.  This is what actually teaches the GRU
-        # to hold information: "you needed to remember what you saw at frame 0 to
-        # predict inventory correctly at frame 150."
         seq_loss = None   # tensor — accumulates the computation graph
 
-        for t in range(start_idx, _chunk_end):
-            _t_rel = t - start_idx
+        for _t_rel, t in enumerate(chunk_indices):
+            is_gui_t = bool(seq['is_gui_inventory'][t])
+
+            # Sliding context window: last context_frames frames within this chunk,
+            # padding the front with the earliest available frame (index 0).
+            # The memory token handles longer-range temporal state across chunks.
+            _ctx_idxs = [max(0, _t_rel - args.context_frames + 1 + i)
+                         for i in range(args.context_frames)]
+            multi_pv  = torch.cat([_pv_per_frame[i]  for i in _ctx_idxs], dim=0)
+            multi_thw = torch.cat([_thw_per_frame[i] for i in _ctx_idxs], dim=0)
+
             inv_id_target    = seq['inventory_ids'][t:t+1].to(device)       # [1, 36] long
             inv_count_target = seq['inventory_counts'][t:t+1].to(device)    # [1, 36] long
 
+            # On GUI-open frames: teacher-force the model to generate the structured
+            # slot text.  This keeps the LM head and all language pathways active,
+            # preventing the backbone representation rank collapse we'd get from
+            # training only on the classification auxiliary head.
+            #
+            # The answer format is [slot_N] item_name count:C — one line per slot.
+            # Extensible to damage/enchants/etc. by editing build_slot_text_target.
+            if is_gui_t:
+                _slot_texts_t = seq['inventory_slot_texts'][t]          # List[str], len 36
+                _slot_cnts_t  = seq['inventory_counts'][t].tolist()     # List[int], len 36
+                _answer_text  = build_slot_text_target(_slot_texts_t, _slot_cnts_t)
+
+                # Build full chat (question + answer) then tokenize.
+                # The question prefix in _full_input_ids is identical to _static_input_ids
+                # (same images, same prompt) so we can mask it by length.
+                _full_chat = processor.apply_chat_template(
+                    [{"role": "user", "content":
+                        [{"type": "image", "image": _dummy_frame}] * args.context_frames
+                        + [{"type": "text", "text": _q_prompt}]
+                      },
+                     {"role": "assistant", "content": _answer_text}],
+                    tokenize=False, add_generation_prompt=False,
+                )
+                _full_enc = processor(
+                    text=_full_chat,
+                    images=[_dummy_frame] * args.context_frames,
+                    return_tensors="pt",
+                )
+                _cur_input_ids = _full_enc['input_ids'].to(device)
+                _cur_attn_mask = _full_enc['attention_mask'].to(device)
+                # Mask question tokens in labels; only supervise the answer portion.
+                _cur_labels    = _cur_input_ids.clone()
+                _cur_labels[0, :_static_input_ids.shape[1]] = -100
+            else:
+                _cur_input_ids = _static_input_ids
+                _cur_attn_mask = _static_attn_mask
+                _cur_labels    = None
+
             outputs = model(
-                input_ids=_static_input_ids,
-                pixel_values=_pv_per_frame[_t_rel],
-                image_grid_thw=_thw_per_frame[_t_rel],
+                input_ids=_cur_input_ids,
+                pixel_values=multi_pv,
+                image_grid_thw=multi_thw,
                 prev_memory=memory,
-                attention_mask=_static_attn_mask,
-                labels=None,
+                attention_mask=_cur_attn_mask,
+                labels=_cur_labels,
             )
 
             # No detach — memory carries the gradient graph across frames.
@@ -746,6 +807,12 @@ def main():
 
             memory_reg = 0.1 * (memory ** 2).mean()
             frame_loss = memory_reg / scale
+
+            # LM loss on GUI frames (outputs.loss = main_loss + model's memory_reg).
+            # Keeps all language pathways active → prevents backbone rank collapse.
+            if outputs.loss is not None:
+                frame_loss = frame_loss + outputs.loss / scale
+                chunk_lm_losses.append(outputs.loss.item())
 
             if outputs.item_logits is not None:
                 item_logits  = outputs.item_logits[0]    # [36, item_vocab_size]
@@ -757,28 +824,43 @@ def main():
                 N_ne = int(non_empty.sum().item())
                 chunk_n_ne.append(N_ne)
 
-                # --- Item type loss: CE over all 36 slots ---
-                # Empty slots (target=0) provide supervision to predict "empty";
-                # non-empty slots must predict the correct item ID.
-                item_loss = F.cross_entropy(item_logits, tgt_ids)
+                # Item type loss: focal CE over all 36 slots.
+                # Computed on ALL frames (GUI-open and GUI-closed) — the VPT data
+                # carries true inventory labels at every tick.  On GUI-closed frames
+                # the head must attend to the memory token to predict correctly,
+                # which forces the GRU to maintain inventory state.
+                _ce_per_slot = F.cross_entropy(item_logits, tgt_ids, reduction='none')  # [36]
+                _pt    = torch.exp(-_ce_per_slot)
+                _focal = (1 - _pt) ** 2.0 * _ce_per_slot  # gamma=2
+                _slot_w = torch.where(tgt_ids == 0,
+                                      torch.full_like(_focal, 0.1),
+                                      torch.ones_like(_focal))
+                item_loss = (_focal * _slot_w).sum() / _slot_w.sum()
 
-                # --- Count loss: CE over non-empty slots only ---
+                # Count loss: focal CE over non-empty slots only.
                 count_loss = None
                 if N_ne > 0:
-                    count_loss = F.cross_entropy(
+                    _cnt_ce = F.cross_entropy(
                         count_logits[non_empty],
                         tgt_counts[non_empty],
+                        reduction='none',
+                    )  # [N_ne]
+                    _cnt_pt    = torch.exp(-_cnt_ce)
+                    _cnt_focal = (1 - _cnt_pt) ** 2.0 * _cnt_ce
+                    _cnt_w = torch.where(
+                        tgt_counts[non_empty] == 1,
+                        torch.full_like(_cnt_focal, 0.1),
+                        torch.ones_like(_cnt_focal),
                     )
+                    count_loss = (_cnt_focal * _cnt_w).sum() / _cnt_w.sum()
 
-                frame_loss = frame_loss + args.inventory_weight * item_loss / scale
+                frame_loss = frame_loss + eff_inv_weight * item_loss / scale
                 tl_val = item_loss.item()
                 chunk_type_losses.append(tl_val)
-                is_gui_t = seq['is_gui_inventory'][t]
 
-                # Top-1 accuracy for training-step monitoring (no extra backward)
+                # Top-1 accuracy — split into GUI / closed for the key diagnostic.
                 with torch.no_grad():
-                    pred_ids    = item_logits.argmax(dim=-1)   # [36]
-                    pred_counts = count_logits.argmax(dim=-1)  # [36]
+                    pred_ids = item_logits.argmax(dim=-1)  # [36]
                     acc_t = (pred_ids == tgt_ids).float().mean().item()
                     chunk_acc_all.append(acc_t)
                     if is_gui_t:
@@ -788,18 +870,15 @@ def main():
                     else:
                         chunk_type_losses_closed.append(tl_val)
                         chunk_acc_closed.append(acc_t)
+
                 if count_loss is not None:
-                    frame_loss = frame_loss + args.count_weight * count_loss / scale
+                    frame_loss = frame_loss + eff_cnt_weight * count_loss / scale
                     chunk_count_losses.append(count_loss.item())
 
             seq_loss = frame_loss if seq_loss is None else seq_loss + frame_loss
             chunk_losses.append(frame_loss.item() * scale)  # display (forces CUDA sync)
 
             # Hard norm cap: clamp memory to unit ball before next frame.
-            # When norm > 1.0 this renormalises to exactly 1.0; when norm ≤ 1.0
-            # it's a no-op.  Differentiable — gradient flows through the division.
-            # The soft memory_reg penalty (above) discourages growth; this hard
-            # cap is the safety net that prevents runaway explosion regardless.
             memory = memory / memory.norm(dim=-1, keepdim=True).clamp(min=1.0)
 
         # Snapshot memory norm before backward frees the graph.
@@ -808,8 +887,8 @@ def main():
         # Single backward through the full bptt_chunk_size frame sequence.
         # Advance the sliding window BEFORE backward so _cur_memory is a plain
         # data tensor unaffected by graph freeing.
-        _cur_memory  = memory.detach()   # carry to next chunk; cut gradient flow
-        _cur_seq_pos = start_idx + args.bptt_chunk_size
+        _cur_memory    = memory.detach()            # carry to next chunk; cut gradient flow
+        _cur_frame_pos += args.bptt_chunk_size      # advance sliding window
 
         # Gradient flows back through GRU recurrence across all frames in this chunk.
         if seq_loss is not None:
@@ -818,6 +897,7 @@ def main():
         # Feed this chunk into the update-window accumulators
         win_type_losses.extend(chunk_type_losses)
         win_count_losses.extend(chunk_count_losses)
+        win_lm_losses.extend(chunk_lm_losses)
 
         # Gradient accumulation: accumulate for grad_accum_steps outer steps before
         # updating.  The loss is already divided by (bptt_chunk_size * grad_accum_steps)
@@ -876,8 +956,10 @@ def main():
             # and reset the accumulators for the next window.
             last_avg_type  = sum(win_type_losses)  / len(win_type_losses)  if win_type_losses  else None
             last_avg_count = sum(win_count_losses) / len(win_count_losses) if win_count_losses else None
+            last_avg_lm    = sum(win_lm_losses)    / len(win_lm_losses)    if win_lm_losses    else None
             win_type_losses.clear()
             win_count_losses.clear()
+            win_lm_losses.clear()
 
         if chunk_losses:
             losses.append(sum(chunk_losses))
@@ -885,6 +967,7 @@ def main():
             avg_loss       = sum(chunk_losses)
             avg_type_loss  = sum(chunk_type_losses)  / len(chunk_type_losses)  if chunk_type_losses  else 0.0
             avg_count_loss = sum(chunk_count_losses) / len(chunk_count_losses) if chunk_count_losses else 0.0
+            avg_lm_loss    = sum(chunk_lm_losses)    / len(chunk_lm_losses)    if chunk_lm_losses    else 0.0
             avg_n_ne       = sum(chunk_n_ne)         / len(chunk_n_ne)         if chunk_n_ne         else 0.0
             # GUI vs closed item accuracy — THE key diagnostic.
             # closed-frame accuracy should rise over training as the model
@@ -900,6 +983,7 @@ def main():
                 'loss':               avg_loss,
                 'type_loss':          avg_type_loss,   # item CE loss (named type_loss for plot compat)
                 'count_loss':         avg_count_loss,
+                'lm_loss':            avg_lm_loss,     # LM CE on GUI-frame slot text targets
                 'n_ne_avg':           avg_n_ne,
                 'n_gui_frames':       chunk_n_gui,
                 # acc_gui:   item top-1 accuracy on GUI-open frames (direct visual read)
@@ -925,10 +1009,11 @@ def main():
                 # Use smoothed (update-window averaged) values for display
                 disp_type  = last_avg_type  if last_avg_type  is not None else avg_type_loss
                 disp_count = last_avg_count if last_avg_count is not None else avg_count_loss
+                disp_lm    = last_avg_lm    if last_avg_lm    is not None else avg_lm_loss
                 gui_str    = f"{acc_gui:.3f}"    if acc_gui    is not None else "  N/A"
                 closed_str = f"{acc_closed:.3f}" if acc_closed is not None else "  N/A"
                 flag = "  *** NO GUI ***" if chunk_n_gui == 0 else ""
-                print(f"{step:>8} item_loss={disp_type:.3f} acc(gui={gui_str} cls={closed_str})"
+                print(f"{step:>8} item={disp_type:.3f} lm={disp_lm:.3f} acc(gui={gui_str} cls={closed_str})"
                       f"  cnt={disp_count:.4f}  N_ne={avg_n_ne:4.1f} gui={chunk_n_gui:3d}"
                       f"  gN={gn_str} hGN={hgn_str} wN={wn_str} mN={memory_norm_end:.2f}"
                       f"  {step_time:>6.1f}s{flag}")
