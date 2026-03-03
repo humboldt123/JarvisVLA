@@ -65,21 +65,19 @@ def create_plot(metrics, output_file):
     steps      = [m['step']                  for m in metrics]
     type_losses= [m.get('type_loss')         for m in metrics]
     cnt_losses = [m.get('count_loss')        for m in metrics]
+    lm_losses  = [m.get('lm_loss')          for m in metrics]
+    rsn_losses = [m.get('reasoning_loss')   for m in metrics]
     n_ne_vals  = [m.get('n_ne_avg', 0)       for m in metrics]
     n_gui_vals = [m.get('n_gui_frames', 0)   for m in metrics]
-    step_times = [m.get('step_time', 0)      for m in metrics]
     mem_norms  = [m.get('memory_norm', 0)    for m in metrics]
+    lr_head    = [m.get('lr_head')           for m in metrics]
+    lr_backbone= [m.get('lr_backbone')       for m in metrics]
 
-    # cos_sim_gui / cos_sim_closed now stores item accuracy (renamed field kept same
-    # for backward compat with old log files).  Detect which era the log is from.
+    # cos_sim_gui / cos_sim_closed stores item accuracy (renamed field kept for compat).
     acc_gui    = [m.get('cos_sim_gui')    for m in metrics]
     acc_closed = [m.get('cos_sim_closed') for m in metrics]
     acc_all    = [m.get('item_acc_all')   for m in metrics]
 
-    # Detect old-style logs (cosine similarity ≤ 1 but can be negative; accuracy 0-1 only)
-    # New logs: values are item top-1 accuracy in [0, 1]
-    # Old logs: values are cosine similarities also in [-1, 1] but semantically different.
-    # We just plot whatever is there under the right axis label.
     is_new_style = any(m.get('item_acc_all') is not None for m in metrics)
     y_label = 'Item Top-1 Accuracy' if is_new_style else 'cos_sim / Accuracy'
 
@@ -88,8 +86,20 @@ def create_plot(metrics, output_file):
     update_gn_s  = [m['step']              for m in metrics if m.get('is_update_step') and m.get('grad_norm', 0) > 0]
     update_hgn   = [m['inv_head_grad_norm'] for m in metrics if m.get('is_update_step')]
 
-    fig, axes = plt.subplots(5, 2, figsize=(16, 25))
-    fig.suptitle('JarvisVLA — Inventory Memory Training (discrete classification)', fontsize=14, fontweight='bold')
+    # Eval-only metrics (from log_summary lines — not per-step)
+    # These are emitted rarely (at eval checkpoints), so we just mark them as points.
+    eval_eff_rank_pts  = []
+    eval_stable_rank_pts = []
+    for m in metrics:
+        _e = m.get('eval_eff_rank')
+        _s = m.get('eval_stable_rank')
+        if _e is not None:
+            eval_eff_rank_pts.append((m['step'], _e))
+        if _s is not None:
+            eval_stable_rank_pts.append((m['step'], _s))
+
+    fig, axes = plt.subplots(6, 2, figsize=(16, 30))
+    fig.suptitle('JarvisVLA — VLA Training Metrics', fontsize=14, fontweight='bold')
 
     # ── Row 0: Item CE loss  |  GUI vs Closed accuracy (THE key diagnostic) ──
     plot_series(axes[0,0], steps, type_losses, 'item CE loss', 'darkorchid',
@@ -127,18 +137,33 @@ def create_plot(metrics, output_file):
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # ── Row 2: Inv-head grad norm  |  Memory norm ────────────────────────────
+    # ── Row 2: LM loss + Reasoning loss  |  Inv-head grad norm ──────────────
     ax = axes[2,0]
+    _lm_v  = [v if v is not None and v > 0 else float('nan') for v in lm_losses]
+    _rsn_v = [v if v is not None and v > 0 else float('nan') for v in rsn_losses]
+    ax.plot(steps, _lm_v,  alpha=0.15, color='royalblue',  linewidth=0.5)
+    ax.plot(steps, smooth(_lm_v),  color='royalblue',  linewidth=2, label='LM (inventory desc)')
+    ax.plot(steps, _rsn_v, alpha=0.15, color='darkorange', linewidth=0.5)
+    ax.plot(steps, smooth(_rsn_v), color='darkorange', linewidth=2, label='LM (reasoning, OpenHermes)')
+    ax.set_xlabel('Step')
+    ax.set_ylabel('CE Loss')
+    ax.set_title('Language Modeling Losses\n'
+                 'inventory desc (even steps) vs reasoning (odd steps)')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[2,1]
     if update_steps:
-        ax.scatter(update_steps, update_hgn,           s=10, color='darkorange', alpha=0.4, zorder=3)
-        ax.plot(update_steps,    smooth(update_hgn),   color='darkorange', linewidth=2, label='inv-head gN')
+        ax.scatter(update_steps, update_hgn,           s=10, color='indigo', alpha=0.4, zorder=3)
+        ax.plot(update_steps,    smooth(update_hgn),   color='indigo', linewidth=2, label='inv-head gN')
     ax.set_xlabel('Step')
     ax.set_ylabel('Norm')
     ax.set_title('Inventory Head Grad Norm\n(should stay > 0; collapse = head stopped learning)')
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    ax = axes[2,1]
+    # ── Row 3: Memory norm  |  LR schedule ──────────────────────────────────
+    ax = axes[3,0]
     ax.plot(steps, mem_norms, alpha=0.25, color='mediumpurple', linewidth=0.6)
     ax.plot(steps, smooth(mem_norms), color='mediumpurple', linewidth=2, label='memory L2 norm')
     ax.set_xlabel('Step')
@@ -147,24 +172,53 @@ def create_plot(metrics, output_file):
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # ── Row 3: Data quality (N_ne, N_gui)  |  Step time ─────────────────────
-    ax = axes[3,0]
-    ax.plot(steps, n_ne_vals,  alpha=0.25, color='cornflowerblue', linewidth=0.6)
-    ax.plot(steps, smooth(n_ne_vals),  color='cornflowerblue', linewidth=2, label='N_ne (non-empty slots)')
-    ax.plot(steps, n_gui_vals, alpha=0.25, color='gold', linewidth=0.6)
-    ax.plot(steps, smooth(n_gui_vals), color='gold',         linewidth=2, label='N_gui (GUI-open frames in window)')
+    ax = axes[3,1]
+    _lr_h_v = [v for v in lr_head     if v is not None]
+    _lr_s_h = [steps[i] for i, v in enumerate(lr_head)     if v is not None]
+    _lr_b_v = [v for v in lr_backbone if v is not None]
+    _lr_s_b = [steps[i] for i, v in enumerate(lr_backbone) if v is not None]
+    if _lr_h_v:
+        ax.plot(_lr_s_h, _lr_h_v, color='steelblue', linewidth=1.5, label='LR head')
+    if _lr_b_v:
+        ax.plot(_lr_s_b, _lr_b_v, color='tomato',    linewidth=1.5, label='LR backbone')
     ax.set_xlabel('Step')
-    ax.set_ylabel('Frames / Slots')
-    ax.set_title('Data Quality: Inventory Richness + GUI Frames per Window\n'
-                 'N_gui=0 every step → anchor sampling failed, check is_gui_inventory')
+    ax.set_ylabel('Learning Rate')
+    ax.set_title('Learning Rate Schedule  (cosine decay)')
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    plot_series(axes[3,1], steps, step_times, 'step time', 'gray',
-                'Step Time per Outer Step', 'Seconds')
+    # ── Row 4: Data quality  |  Effective rank ───────────────────────────────
+    ax = axes[4,0]
+    ax.plot(steps, n_ne_vals,  alpha=0.25, color='cornflowerblue', linewidth=0.6)
+    ax.plot(steps, smooth(n_ne_vals),  color='cornflowerblue', linewidth=2, label='N_ne (non-empty slots)')
+    ax.plot(steps, n_gui_vals, alpha=0.25, color='gold', linewidth=0.6)
+    ax.plot(steps, smooth(n_gui_vals), color='gold',         linewidth=2, label='N_gui (GUI-open frames)')
+    ax.set_xlabel('Step')
+    ax.set_ylabel('Frames / Slots')
+    ax.set_title('Data Quality: Inventory Richness + GUI Frames per Window')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
 
-    # ── Row 4: Memory retention scatter  |  GUI−Closed gap over time ────────
-    ax = axes[4, 0]
+    ax = axes[4,1]
+    if eval_eff_rank_pts:
+        _er_s, _er_v = zip(*eval_eff_rank_pts)
+        ax.scatter(_er_s, _er_v, color='firebrick', s=50, zorder=4, label='eff rank (eval)')
+        ax.plot(_er_s, _er_v, color='firebrick', linewidth=1.5)
+    if eval_stable_rank_pts:
+        _sr_s, _sr_v = zip(*eval_stable_rank_pts)
+        ax.scatter(_sr_s, _sr_v, color='darkorange', s=30, zorder=3, label='stable rank (eval)', marker='s')
+        ax.plot(_sr_s, _sr_v, color='darkorange', linewidth=1, linestyle='--')
+    ax.axhline(y=50,  linestyle=':', color='red',  alpha=0.5, linewidth=1.2)
+    ax.axhline(y=500, linestyle=':', color='green', alpha=0.5, linewidth=1.2)
+    ax.set_xlabel('Step')
+    ax.set_ylabel('Rank')
+    ax.set_title('Effective Rank of Last-Layer Hidden States  (eval only)\n'
+                 'red dashed=collapse threshold(50), green=healthy(500)')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # ── Row 5: Memory retention scatter  |  GUI−Closed gap ──────────────────
+    ax = axes[5,0]
     valid_pts = [
         (steps[i], acc_gui[i], acc_closed[i])
         for i in range(len(steps))
@@ -180,12 +234,12 @@ def create_plot(metrics, output_file):
         ax.plot([_lo, _hi], [_lo, _hi], 'k--', alpha=0.35, linewidth=1.2, label='y=x  (no gap)')
     ax.set_xlabel('Accuracy GUI-open (visual read)')
     ax.set_ylabel('Accuracy GUI-closed (memory retention)')
-    ax.set_title('Memory retention: GUI-open vs GUI-closed accuracy\n'
-                 'should close over training  (blue=early steps, red=late steps)')
+    ax.set_title('Memory retention: GUI-open vs GUI-closed\n'
+                 'should close over training  (blue=early, red=late)')
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    ax = axes[4, 1]
+    ax = axes[5,1]
     gap = [
         (acc_gui[i] - acc_closed[i])
         if (acc_gui[i] not in (None, 0.0) and acc_closed[i] not in (None, 0.0)
@@ -198,8 +252,7 @@ def create_plot(metrics, output_file):
     ax.axhline(y=0, linestyle=':', color='black', alpha=0.4)
     ax.set_xlabel('Step')
     ax.set_ylabel('acc_gui − acc_closed')
-    ax.set_title('GUI/Closed accuracy gap over training\n'
-                 'Should trend → 0  as GRU learns to retain inventory')
+    ax.set_title('GUI/Closed accuracy gap\nShould trend → 0 as GRU learns to retain inventory')
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 

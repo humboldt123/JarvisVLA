@@ -53,13 +53,13 @@ def evaluate(model, test_loader, processor, args, device):
     n_count     = 0
     display_examples = []
 
-    # Build chat template once
+    # Build chat template with context_frames images — must match training setup.
     _dummy = test_loader[0]['frames'][0]
     chat_text = processor.apply_chat_template(
-        [{"role": "user", "content": [
-            {"type": "image", "image": _dummy},
-            {"type": "text", "text": "What is in the inventory?"},
-        ]}],
+        [{"role": "user", "content":
+            [{"type": "image", "image": _dummy}] * args.context_frames
+            + [{"type": "text", "text": "What is in the inventory?"}]
+        }],
         tokenize=False, add_generation_prompt=True,
     )
 
@@ -73,8 +73,17 @@ def evaluate(model, test_loader, processor, args, device):
             memory = torch.zeros(1, args.memory_dim, device=device, dtype=torch.bfloat16)
             is_gui_list = seq.get('is_gui_inventory', [False] * seq_len)
 
-            for t in range(len(seq['frames'])):
-                frame            = seq['frames'][t]
+            # Seek to first GUI-open frame where n_ne > 9 — same logic as training.
+            # Without this, memory starts at zero and the eval measures an impossible
+            # condition: predict inventory that was never visually observed.
+            _n_ne_seq = (seq['inventory_ids'] > 0).sum(dim=1)  # [seq_len]
+            _gui_rich = [
+                i for i in range(seq_len)
+                if is_gui_list[i] and _n_ne_seq[i].item() > 9
+            ]
+            start_t = _gui_rich[0] if _gui_rich else 0
+
+            for t in range(start_t, len(seq['frames'])):
                 inv_id_target    = seq['inventory_ids'][t:t+1].to(device)      # [1, 36] long
                 inv_count_target = seq['inventory_counts'][t:t+1].to(device)   # [1, 36] long
                 is_non_empty     = seq['inventory_has_items'][t]
@@ -83,7 +92,12 @@ def evaluate(model, test_loader, processor, args, device):
                                            [['empty slot'] * 36] * len(seq['frames']))[t]
                 slot_counts      = seq['inventory_counts'][t]
 
-                inputs = processor(text=chat_text, images=[frame], return_tensors="pt")
+                # Sliding context window — matches training context_frames setup.
+                _ctx_idxs = [max(start_t, t - args.context_frames + 1 + i)
+                             for i in range(args.context_frames)]
+                ctx_frames = [seq['frames'][i] for i in _ctx_idxs]
+
+                inputs = processor(text=chat_text, images=ctx_frames, return_tensors="pt")
                 inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                           for k, v in inputs.items()}
 
@@ -218,6 +232,8 @@ def main():
     parser.add_argument('--sequence_length',  type=int, default=200,
                         help='Frames per eval sequence')
     parser.add_argument('--memory_dim',       type=int, default=1024)
+    parser.add_argument('--context_frames',   type=int, default=4,
+                        help='Context frames per input — must match training value')
     parser.add_argument('--output_json',      default=None,
                         help='Optional path to save eval metrics as JSON')
     args = parser.parse_args()

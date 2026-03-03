@@ -23,6 +23,7 @@ from typing import Dict, List
 import functools
 
 import random
+import itertools
 
 import torch
 import torch.nn as nn
@@ -263,6 +264,10 @@ def evaluate_on_test_set(model, test_loader, processor, args, device, rank, logg
     n_non_empty = 0
     n_count     = 0
     display_examples: List[Dict] = []
+    # Accumulate last-layer hidden states (last position) for effective rank computation.
+    # Only on rank 0 — FSDP all-gathers during forward, so all ranks have identical
+    # hidden state values; computing SVD on rank 0 saves redundant work.
+    hidden_states_accum: List[torch.Tensor] = []
 
     with torch.no_grad():
         for seq_idx in range(num_seqs):
@@ -345,12 +350,44 @@ def evaluate_on_test_set(model, test_loader, processor, args, device, rank, logg
                             ],
                         })
 
+                # Collect last-layer hidden state at final sequence position for
+                # effective rank tracking.  Only on rank 0 to save compute.
+                if rank == 0 and outputs.hidden_states is not None:
+                    _h = outputs.hidden_states[-1][:, -1, :].float().cpu()  # [1, hidden_dim]
+                    hidden_states_accum.append(_h)
+
                 memory = outputs.new_memory.detach()
 
     avg_item_acc   = total_item_acc  / max(n_total,     1)
     avg_ne_acc     = ne_item_acc     / max(n_non_empty, 1)
     avg_count_acc  = total_count_acc / max(n_count,     1)
     non_empty_pct  = 100.0 * n_non_empty / max(n_total, 1)
+
+    # ── Effective rank of hidden states ──────────────────────────────────────
+    # Effective rank = exp(H(p)) where p_i = sigma_i / sum(sigmas) is the
+    # normalised singular value distribution.  High erank (close to hidden_dim)
+    # means the representation uses many independent directions.  Collapsing
+    # representations show dramatic erank drops (e.g., 3584 → <20).
+    eval_eff_rank   = None
+    eval_stable_rank = None
+    if rank == 0 and hidden_states_accum:
+        H = torch.cat(hidden_states_accum, dim=0)   # [N, hidden_dim]
+        # Subsample to 256 frames max to keep SVD fast (< 1s on CPU)
+        if H.shape[0] > 256:
+            _idx = torch.randperm(H.shape[0])[:256]
+            H = H[_idx]
+        # Mean-centre so SVD reflects variance structure, not mean offset
+        H = H - H.mean(dim=0, keepdim=True)
+        try:
+            _, S, _ = torch.linalg.svd(H, full_matrices=False)
+            S = S.float().clamp(min=0)
+            _p = S / (S.sum() + 1e-10)
+            eval_eff_rank    = float(torch.exp(-(_p * torch.log(_p + 1e-10)).sum()).item())
+            eval_stable_rank = float((S ** 2).sum() / (S[0] ** 2 + 1e-10))
+        except Exception as _svd_err:
+            if rank == 0:
+                print(f"  [WARNING] SVD for effective rank failed: {_svd_err}")
+    # ── End effective rank ────────────────────────────────────────────────────
 
     eval_metrics = {
         'eval_item_acc':          avg_item_acc,
@@ -359,6 +396,8 @@ def evaluate_on_test_set(model, test_loader, processor, args, device, rank, logg
         'eval_non_empty_pct':     non_empty_pct,
         'eval_n_frames':          n_total,
         'eval_seqs':              num_seqs,
+        'eval_eff_rank':          eval_eff_rank,
+        'eval_stable_rank':       eval_stable_rank,
     }
     logger.log_summary({'final_eval': eval_metrics})
 
@@ -370,6 +409,10 @@ def evaluate_on_test_set(model, test_loader, processor, args, device, rank, logg
         print(f"  Item top-1 acc (non-empty) : {avg_ne_acc:.4f}"
               f"  ({n_non_empty}/{n_total} = {non_empty_pct:.1f}%)")
         print(f"  Count top-1 acc (non-empty): {avg_count_acc:.4f}")
+        if eval_eff_rank is not None:
+            print(f"  Effective rank (last layer): {eval_eff_rank:.1f}  "
+                  f"stable_rank={eval_stable_rank:.1f}  "
+                  f"(collapse if eff_rank < 50)")
 
         if display_examples:
             print(f"\n--- Inventory head predictions (non-empty frames) ---")
@@ -396,7 +439,8 @@ def evaluate_on_test_set(model, test_loader, processor, args, device, rank, logg
     return eval_metrics
 
 
-def save_checkpoint(model, step, losses, metrics_logger, output_dir, rank):
+def save_checkpoint(model, step, losses, metrics_logger, output_dir, rank,
+                    optimizer=None, lr_scheduler=None):
     """Save FSDP checkpoint using FULL_STATE_DICT.
 
     All ranks must call this — FSDP all-gathers the full model to rank 0's CPU.
@@ -417,6 +461,8 @@ def save_checkpoint(model, step, losses, metrics_logger, output_dir, rank):
         torch.save({
             'step': step,
             'model_state_dict': model_state_dict,
+            'optimizer_state_dict': optimizer.state_dict() if optimizer is not None else None,
+            'scheduler_state_dict': lr_scheduler.state_dict() if lr_scheduler is not None else None,
             'losses': losses,
         }, checkpoint_path)
         print(f"\n[CHECKPOINT] Saved to {checkpoint_path}")
@@ -475,12 +521,27 @@ def main():
                              'call (JarvisVLA-style).  Frame t sees [t-ctx+1 … t], padded with '
                              'the earliest available frame.  Larger values give the model richer '
                              'temporal context at the cost of ~context_frames× more image tokens.')
+    parser.add_argument('--hotbar_only_steps', type=int, default=5000,
+                        help='For this many steps, mask main inventory slots (9-35) from '
+                             'classification loss when no GUI-open frame has been seen yet '
+                             'in the current sequence.  Prevents false gradients from '
+                             'penalizing predictions for items the model cannot observe. '
+                             'Set 0 to disable.')
     parser.add_argument('--inv_warmup_steps', type=int, default=500,
                         help='Linear warmup steps for inventory/count loss weights.  '
                              'Ramps from 0 → inventory_weight / count_weight over this many '
                              'steps.  Prevents the auxiliary gradient from destabilising the '
                              'backbone before the head has converged (observed 300k grad-norm '
                              'spikes without warmup).')
+    parser.add_argument('--lm_weight', type=float, default=1.0,
+                        help='Scale factor for the LM cross-entropy loss (both inventory '
+                             'description and reasoning tasks). Default 1.0.')
+    parser.add_argument('--hf_token', type=str, default=None,
+                        help='HuggingFace token for loading teknium/OpenHermes-2.5 reasoning '
+                             'dataset. If None, reasoning alternation is skipped and only '
+                             'inventory description LM supervision is used.')
+    parser.add_argument('--no_cosine_decay', action='store_true',
+                        help='Disable cosine LR decay (keep constant LR throughout training).')
     args = parser.parse_args()
     
     # Setup
@@ -584,10 +645,23 @@ def main():
     ]
     optimizer = torch.optim.AdamW(param_groups)
 
+    # Cosine LR decay: ramps each param group's LR from its initial value to eta_min
+    # over the full training run.  The two-group setup (head 5e-4, backbone 5e-6) decays
+    # independently — each group is handled by CosineAnnealingLR's per-group tracking.
+    if not args.no_cosine_decay:
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.train_steps,
+            eta_min=1e-7,
+        )
+    else:
+        lr_scheduler = None
+
     if rank == 0:
         print(f"\n[2/5] Optimizer:")
         print(f"  Head+mem params : LR={args.learning_rate}  ({len(head_params_list)} tensors)")
         print(f"  Backbone params : LR={args.base_model_lr}  ({len(backbone_params_list)} tensors)")
+        print(f"  LR schedule     : {'cosine decay → 1e-7' if not args.no_cosine_decay else 'constant'}")
     
     # Resume if needed
     start_step = 0
@@ -601,6 +675,10 @@ def main():
             model.load_state_dict(checkpoint['model_state_dict'])
         start_step = checkpoint.get('step', 0)
         losses = checkpoint.get('losses', [])
+        if checkpoint.get('optimizer_state_dict') is not None:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if lr_scheduler is not None and checkpoint.get('scheduler_state_dict') is not None:
+            lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     
     # Data setup
     if rank == 0:
@@ -624,7 +702,42 @@ def main():
     if rank == 0:
         print(f"  Training sequences: {len(train_loader)}")
         print(f"  Test sequences:     {len(test_loader)}  (files {args.train_jsonls}–{args.train_jsonls + args.test_jsonls})")
-    
+
+    # ── OpenHermes-2.5 reasoning dataset ──────────────────────────────────────
+    # Loaded on all ranks; each rank independently cycles through the same
+    # shuffled list so reasoning samples stay in sync across GPUs.
+    # Only used when --hf_token is provided; otherwise reasoning steps are skipped.
+    reasoning_iter = None
+    if args.hf_token:
+        if rank == 0:
+            print(f"\n[3.5/5] Loading OpenHermes-2.5 reasoning dataset...")
+        try:
+            from datasets import load_dataset as hf_load_dataset
+            _hf_ds = hf_load_dataset(
+                "teknium/OpenHermes-2.5",
+                split="train",
+                token=args.hf_token,
+            )
+            # Keep only clean 2-turn conversations (human → gpt)
+            _reasoning_data = [
+                x for x in _hf_ds
+                if (len(x.get('conversations', [])) >= 2
+                    and x['conversations'][0].get('from') in ('human', 'user')
+                    and x['conversations'][1].get('from') in ('gpt', 'assistant')
+                    and len(x['conversations'][0].get('value', '')) >= 10
+                    and len(x['conversations'][1].get('value', '')) >= 10)
+            ]
+            random.shuffle(_reasoning_data)
+            reasoning_iter = itertools.cycle(_reasoning_data)
+            if rank == 0:
+                print(f"  {len(_reasoning_data):,} reasoning examples loaded and shuffled.")
+        except Exception as _e:
+            if rank == 0:
+                print(f"  [WARNING] Failed to load OpenHermes-2.5: {_e}")
+                print(f"  Continuing without reasoning tasks.")
+            reasoning_iter = None
+    # ── End OpenHermes loading ─────────────────────────────────────────────────
+
     # Training loop
     if rank == 0:
         print(f"\n[4/5] Training from step {start_step} to {args.train_steps}...")
@@ -642,17 +755,20 @@ def main():
     # Accumulators for smoothed display: averaged over the current update window
     # (grad_accum_steps chunks).  Reset at each optimizer step so the display
     # always shows "what did the gradient that just fired actually represent?"
-    win_type_losses  = []
-    win_count_losses = []
-    win_lm_losses    = []
+    win_type_losses      = []
+    win_count_losses     = []
+    win_lm_losses        = []
+    win_reasoning_losses = []
     # Cached smoothed values — shown at every log step even between update steps
-    last_avg_type  = None
-    last_avg_count = None
-    last_avg_lm    = None
+    last_avg_type      = None
+    last_avg_count     = None
+    last_avg_lm        = None
+    last_avg_reasoning = None
 
     _cur_seq       = None   # currently loaded sequence dict
     _cur_frame_pos = 0      # start of current BPTT chunk within _cur_seq
     _cur_memory    = None   # detached memory carry-over (None = reset to zeros)
+    _had_gui_seq   = False  # True once a GUI-open frame has been seen in current sequence
 
     for step in range(start_step, args.train_steps):
         step_start = time.time()
@@ -660,16 +776,28 @@ def main():
         model.train()
         model.train_aux_heads(True)  # Enable inventory head
         chunk_losses = []
-        chunk_type_losses = []     # item CE loss (logged as "type_loss" for plot compat)
+        chunk_type_losses = []        # item CE loss (logged as "type_loss" for plot compat)
         chunk_count_losses = []
-        chunk_lm_losses   = []    # LM cross-entropy on GUI-frame inventory text targets
-        chunk_n_ne = []            # non-empty slot counts per frame
-        chunk_type_losses_gui    = []   # item loss on GUI-open frames
-        chunk_type_losses_closed = []   # item loss on GUI-closed frames
+        chunk_lm_losses        = []   # LM CE on GUI-frame inventory description targets
+        chunk_reasoning_losses = []   # LM CE on reasoning task targets (OpenHermes)
+        chunk_n_ne = []               # non-empty slot counts per frame
+        chunk_type_losses_gui    = [] # item loss on GUI-open frames
+        chunk_type_losses_closed = [] # item loss on GUI-closed frames
         chunk_acc_all:    List[float] = []
         chunk_acc_gui:    List[float] = []
         chunk_acc_closed: List[float] = []
-        chunk_n_gui = 0            # how many frames had the GUI open this step
+        chunk_n_gui = 0               # how many frames had the GUI open this step
+
+        # Alternating reasoning/inventory supervision.
+        # Odd steps → reasoning task from OpenHermes (if available).
+        # Even steps → inventory description (structured or NL format).
+        # Memory always updates from visual features regardless of step type.
+        _is_reasoning_step = (reasoning_iter is not None) and (step % 2 == 1)
+        _reasoning_q = _reasoning_a = None
+        if _is_reasoning_step:
+            _sample = next(reasoning_iter)
+            _reasoning_q = _sample['conversations'][0]['value'][:2000]
+            _reasoning_a = _sample['conversations'][1]['value'][:1500]
 
         # Load a new sequence when the current one is exhausted.
         _need_new_seq = (
@@ -681,6 +809,23 @@ def main():
             _cur_seq       = train_loader[seq_idx]
             _cur_frame_pos = 0
             _cur_memory    = None   # new sequence → reset memory to zeros
+            _had_gui_seq   = False  # reset GUI-seen flag for new sequence
+
+            # If the player carries >9 items (beyond the always-visible hotbar),
+            # seek to the first GUI-open frame so the model can read the full
+            # inventory before the GUI closes.  The subsequent closed-GUI chunks
+            # then create the core memory-retention signal we want to train.
+            # For ≤9 items the hotbar is sufficient; no seek needed.
+            _n_ne_seq = (_cur_seq['inventory_ids'] > 0).sum(dim=1)  # [seq_len]
+            _gui_seq  = _cur_seq['is_gui_inventory']
+            _gui_rich = [
+                i for i in range(len(_gui_seq))
+                if _gui_seq[i]
+                and _n_ne_seq[i].item() > 9
+                and i + args.bptt_chunk_size <= len(_cur_seq['frames'])
+            ]
+            if _gui_rich:
+                _cur_frame_pos = _gui_rich[0]
 
         seq           = _cur_seq
         chunk_indices = list(range(_cur_frame_pos, _cur_frame_pos + args.bptt_chunk_size))
@@ -743,6 +888,8 @@ def main():
 
         for _t_rel, t in enumerate(chunk_indices):
             is_gui_t = bool(seq['is_gui_inventory'][t])
+            if is_gui_t:
+                _had_gui_seq = True  # unlocks main inventory supervision for this sequence
 
             # Sliding context window: last context_frames frames within this chunk,
             # padding the front with the earliest available frame (index 0).
@@ -755,14 +902,50 @@ def main():
             inv_id_target    = seq['inventory_ids'][t:t+1].to(device)       # [1, 36] long
             inv_count_target = seq['inventory_counts'][t:t+1].to(device)    # [1, 36] long
 
-            # On GUI-open frames: teacher-force the model to generate the structured
-            # slot text.  This keeps the LM head and all language pathways active,
-            # preventing the backbone representation rank collapse we'd get from
-            # training only on the classification auxiliary head.
+            # LM supervision: alternates between inventory description and reasoning.
             #
-            # The answer format is [slot_N] item_name count:C — one line per slot.
-            # Extensible to damage/enchants/etc. by editing build_slot_text_target.
-            if is_gui_t:
+            # Reasoning step (odd steps, frame 0 only):
+            #   Apply one OpenHermes Q&A with the current Minecraft frame as visual
+            #   context.  The model sees a game screenshot + unrelated question, which
+            #   forces the LM head to remain functional for diverse text tasks and
+            #   prevents catastrophic forgetting of language capabilities.
+            #   Frames 1+ in the chunk: no LM supervision (classification head still runs).
+            #
+            # Inventory step (even steps, GUI-open frames only):
+            #   Teacher-force the model to generate inventory state as [slot_N] text.
+            #   Keeps all language pathways active; prevents backbone rank collapse.
+            if _is_reasoning_step and _t_rel == 0:
+                # Reasoning task: context_frames images + OpenHermes Q → A
+                _rsn_full_chat = processor.apply_chat_template(
+                    [{"role": "user", "content":
+                        [{"type": "image", "image": _dummy_frame}] * args.context_frames
+                        + [{"type": "text", "text": _reasoning_q}]},
+                     {"role": "assistant", "content": _reasoning_a}],
+                    tokenize=False, add_generation_prompt=False,
+                )
+                _rsn_q_chat = processor.apply_chat_template(
+                    [{"role": "user", "content":
+                        [{"type": "image", "image": _dummy_frame}] * args.context_frames
+                        + [{"type": "text", "text": _reasoning_q}]}],
+                    tokenize=False, add_generation_prompt=True,
+                )
+                _rsn_full_enc = processor(
+                    text=_rsn_full_chat,
+                    images=[_dummy_frame] * args.context_frames,
+                    return_tensors="pt",
+                )
+                _rsn_q_len = processor(
+                    text=_rsn_q_chat,
+                    images=[_dummy_frame] * args.context_frames,
+                    return_tensors="pt",
+                )['input_ids'].shape[1]
+                _cur_input_ids = _rsn_full_enc['input_ids'].to(device)
+                _cur_attn_mask = _rsn_full_enc['attention_mask'].to(device)
+                _cur_labels    = _cur_input_ids.clone()
+                _cur_labels[0, :_rsn_q_len] = -100   # mask question, supervise answer
+
+            elif not _is_reasoning_step and is_gui_t:
+                # Inventory description: [slot_N] item_name count:C format (structured)
                 _slot_texts_t = seq['inventory_slot_texts'][t]          # List[str], len 36
                 _slot_cnts_t  = seq['inventory_counts'][t].tolist()     # List[int], len 36
                 _answer_text  = build_slot_text_target(_slot_texts_t, _slot_cnts_t)
@@ -773,8 +956,7 @@ def main():
                 _full_chat = processor.apply_chat_template(
                     [{"role": "user", "content":
                         [{"type": "image", "image": _dummy_frame}] * args.context_frames
-                        + [{"type": "text", "text": _q_prompt}]
-                      },
+                        + [{"type": "text", "text": _q_prompt}]},
                      {"role": "assistant", "content": _answer_text}],
                     tokenize=False, add_generation_prompt=False,
                 )
@@ -788,7 +970,10 @@ def main():
                 # Mask question tokens in labels; only supervise the answer portion.
                 _cur_labels    = _cur_input_ids.clone()
                 _cur_labels[0, :_static_input_ids.shape[1]] = -100
+
             else:
+                # No LM supervision: closed frame on inventory step, or non-first
+                # frame on reasoning step.  Classification head still trains.
                 _cur_input_ids = _static_input_ids
                 _cur_attn_mask = _static_attn_mask
                 _cur_labels    = None
@@ -808,11 +993,14 @@ def main():
             memory_reg = 0.1 * (memory ** 2).mean()
             frame_loss = memory_reg / scale
 
-            # LM loss on GUI frames (outputs.loss = main_loss + model's memory_reg).
+            # LM loss: scaled by lm_weight for both inventory description and reasoning.
             # Keeps all language pathways active → prevents backbone rank collapse.
             if outputs.loss is not None:
-                frame_loss = frame_loss + outputs.loss / scale
-                chunk_lm_losses.append(outputs.loss.item())
+                frame_loss = frame_loss + args.lm_weight * outputs.loss / scale
+                if _is_reasoning_step and _t_rel == 0:
+                    chunk_reasoning_losses.append(outputs.loss.item())
+                else:
+                    chunk_lm_losses.append(outputs.loss.item())
 
             if outputs.item_logits is not None:
                 item_logits  = outputs.item_logits[0]    # [36, item_vocab_size]
@@ -824,31 +1012,39 @@ def main():
                 N_ne = int(non_empty.sum().item())
                 chunk_n_ne.append(N_ne)
 
-                # Item type loss: focal CE over all 36 slots.
-                # Computed on ALL frames (GUI-open and GUI-closed) — the VPT data
-                # carries true inventory labels at every tick.  On GUI-closed frames
-                # the head must attend to the memory token to predict correctly,
-                # which forces the GRU to maintain inventory state.
+                # Hotbar curriculum: before hotbar_only_steps, when no GUI-open frame
+                # has been seen in this sequence, mask main inventory slots (9-35).
+                # Slots 0-8 (hotbar) are always visible on screen.
+                # Slots 9-35 require GUI open — penalising predictions for items the
+                # model cannot see creates false gradients toward modal items.
+                _supervised = torch.ones(36, dtype=torch.bool, device=device)
+                if step < args.hotbar_only_steps and not _had_gui_seq:
+                    _supervised[9:] = False
+
+                # Item type loss: focal CE over supervised slots.
                 _ce_per_slot = F.cross_entropy(item_logits, tgt_ids, reduction='none')  # [36]
                 _pt    = torch.exp(-_ce_per_slot)
                 _focal = (1 - _pt) ** 2.0 * _ce_per_slot  # gamma=2
                 _slot_w = torch.where(tgt_ids == 0,
                                       torch.full_like(_focal, 0.1),
                                       torch.ones_like(_focal))
-                item_loss = (_focal * _slot_w).sum() / _slot_w.sum()
+                _slot_w = _slot_w * _supervised.float()
+                item_loss = (_focal * _slot_w).sum() / _slot_w.sum().clamp(min=1.0)
 
-                # Count loss: focal CE over non-empty slots only.
+                # Count loss: focal CE over supervised non-empty slots only.
                 count_loss = None
-                if N_ne > 0:
+                _sup_ne = non_empty & _supervised
+                N_sup_ne = int(_sup_ne.sum().item())
+                if N_sup_ne > 0:
                     _cnt_ce = F.cross_entropy(
-                        count_logits[non_empty],
-                        tgt_counts[non_empty],
+                        count_logits[_sup_ne],
+                        tgt_counts[_sup_ne],
                         reduction='none',
-                    )  # [N_ne]
+                    )
                     _cnt_pt    = torch.exp(-_cnt_ce)
                     _cnt_focal = (1 - _cnt_pt) ** 2.0 * _cnt_ce
                     _cnt_w = torch.where(
-                        tgt_counts[non_empty] == 1,
+                        tgt_counts[_sup_ne] == 1,
                         torch.full_like(_cnt_focal, 0.1),
                         torch.ones_like(_cnt_focal),
                     )
@@ -898,6 +1094,7 @@ def main():
         win_type_losses.extend(chunk_type_losses)
         win_count_losses.extend(chunk_count_losses)
         win_lm_losses.extend(chunk_lm_losses)
+        win_reasoning_losses.extend(chunk_reasoning_losses)
 
         # Gradient accumulation: accumulate for grad_accum_steps outer steps before
         # updating.  The loss is already divided by (bptt_chunk_size * grad_accum_steps)
@@ -951,15 +1148,19 @@ def main():
             last_gn = float(grad_norm.item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm or 0.0)
             optimizer.step()
             optimizer.zero_grad()
+            if lr_scheduler is not None:
+                lr_scheduler.step()
 
             # Compute smoothed display values from the just-completed update window
             # and reset the accumulators for the next window.
-            last_avg_type  = sum(win_type_losses)  / len(win_type_losses)  if win_type_losses  else None
-            last_avg_count = sum(win_count_losses) / len(win_count_losses) if win_count_losses else None
-            last_avg_lm    = sum(win_lm_losses)    / len(win_lm_losses)    if win_lm_losses    else None
+            last_avg_type      = sum(win_type_losses)      / len(win_type_losses)      if win_type_losses      else None
+            last_avg_count     = sum(win_count_losses)     / len(win_count_losses)     if win_count_losses     else None
+            last_avg_lm        = sum(win_lm_losses)        / len(win_lm_losses)        if win_lm_losses        else None
+            last_avg_reasoning = sum(win_reasoning_losses) / len(win_reasoning_losses) if win_reasoning_losses else None
             win_type_losses.clear()
             win_count_losses.clear()
             win_lm_losses.clear()
+            win_reasoning_losses.clear()
 
         if chunk_losses:
             losses.append(sum(chunk_losses))
@@ -967,8 +1168,9 @@ def main():
             avg_loss       = sum(chunk_losses)
             avg_type_loss  = sum(chunk_type_losses)  / len(chunk_type_losses)  if chunk_type_losses  else 0.0
             avg_count_loss = sum(chunk_count_losses) / len(chunk_count_losses) if chunk_count_losses else 0.0
-            avg_lm_loss    = sum(chunk_lm_losses)    / len(chunk_lm_losses)    if chunk_lm_losses    else 0.0
-            avg_n_ne       = sum(chunk_n_ne)         / len(chunk_n_ne)         if chunk_n_ne         else 0.0
+            avg_lm_loss        = sum(chunk_lm_losses)        / len(chunk_lm_losses)        if chunk_lm_losses        else 0.0
+            avg_reasoning_loss = sum(chunk_reasoning_losses) / len(chunk_reasoning_losses) if chunk_reasoning_losses else 0.0
+            avg_n_ne           = sum(chunk_n_ne)             / len(chunk_n_ne)             if chunk_n_ne             else 0.0
             # GUI vs closed item accuracy — THE key diagnostic.
             # closed-frame accuracy should rise over training as the model
             # learns to retain inventory state through the GRU memory.
@@ -979,11 +1181,16 @@ def main():
             step_time = time.time() - step_start
             step_times.append(step_time)
 
+            # Current LR for each param group (only meaningful on update steps)
+            _lr_head     = optimizer.param_groups[0]['lr']
+            _lr_backbone = optimizer.param_groups[1]['lr'] if len(optimizer.param_groups) > 1 else _lr_head
+
             metrics = {
                 'loss':               avg_loss,
-                'type_loss':          avg_type_loss,   # item CE loss (named type_loss for plot compat)
+                'type_loss':          avg_type_loss,       # item CE loss (named type_loss for plot compat)
                 'count_loss':         avg_count_loss,
-                'lm_loss':            avg_lm_loss,     # LM CE on GUI-frame slot text targets
+                'lm_loss':            avg_lm_loss,         # LM CE on inventory description frames
+                'reasoning_loss':     avg_reasoning_loss,  # LM CE on OpenHermes reasoning frames
                 'n_ne_avg':           avg_n_ne,
                 'n_gui_frames':       chunk_n_gui,
                 # acc_gui:   item top-1 accuracy on GUI-open frames (direct visual read)
@@ -996,6 +1203,8 @@ def main():
                 'grad_norm':          last_gn or 0.0,
                 'inv_head_grad_norm': inv_head_grad_norm or 0.0,
                 'inv_head_weight_norm': inv_head_weight_norm or 0.0,
+                'lr_head':            _lr_head,
+                'lr_backbone':        _lr_backbone,
                 'step_time':          step_time,
                 'is_update_step':     is_update_step,
             }
@@ -1007,23 +1216,29 @@ def main():
                 hgn_str = f"{last_hgn:.3f}" if last_hgn is not None else "  N/A"
                 wn_str  = f"{last_wn:.3f}"  if last_wn  is not None else "    N/A"
                 # Use smoothed (update-window averaged) values for display
-                disp_type  = last_avg_type  if last_avg_type  is not None else avg_type_loss
-                disp_count = last_avg_count if last_avg_count is not None else avg_count_loss
-                disp_lm    = last_avg_lm    if last_avg_lm    is not None else avg_lm_loss
+                disp_type      = last_avg_type      if last_avg_type      is not None else avg_type_loss
+                disp_count     = last_avg_count     if last_avg_count     is not None else avg_count_loss
+                disp_lm        = last_avg_lm        if last_avg_lm        is not None else avg_lm_loss
+                disp_reasoning = last_avg_reasoning if last_avg_reasoning is not None else avg_reasoning_loss
                 gui_str    = f"{acc_gui:.3f}"    if acc_gui    is not None else "  N/A"
                 closed_str = f"{acc_closed:.3f}" if acc_closed is not None else "  N/A"
-                flag = "  *** NO GUI ***" if chunk_n_gui == 0 else ""
-                print(f"{step:>8} item={disp_type:.3f} lm={disp_lm:.3f} acc(gui={gui_str} cls={closed_str})"
+                step_type  = "rsn" if _is_reasoning_step else "inv"
+                flag = "  *** NO GUI ***" if chunk_n_gui == 0 and not _is_reasoning_step and avg_n_ne > 9 else ""
+                print(f"{step:>8}[{step_type}] item={disp_type:.3f} "
+                      f"lm={disp_lm:.3f} rsn={disp_reasoning:.3f} "
+                      f"acc(gui={gui_str} cls={closed_str})"
                       f"  cnt={disp_count:.4f}  N_ne={avg_n_ne:4.1f} gui={chunk_n_gui:3d}"
                       f"  gN={gn_str} hGN={hgn_str} wN={wn_str} mN={memory_norm_end:.2f}"
                       f"  {step_time:>6.1f}s{flag}")
 
         # Checkpoint
         if (step + 1) % args.eval_every == 0:
-            save_checkpoint(model, step + 1, losses, logger, args.output_dir, rank)
-    
+            save_checkpoint(model, step + 1, losses, logger, args.output_dir, rank,
+                            optimizer=optimizer, lr_scheduler=lr_scheduler)
+
     # Final save
-    save_checkpoint(model, args.train_steps, losses, logger, args.output_dir, rank)
+    save_checkpoint(model, args.train_steps, losses, logger, args.output_dir, rank,
+                    optimizer=optimizer, lr_scheduler=lr_scheduler)
 
     # Final evaluation on held-out test set
     eval_metrics = evaluate_on_test_set(model, test_loader, processor, args, device, rank, logger)
